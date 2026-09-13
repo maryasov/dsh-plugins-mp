@@ -18,6 +18,8 @@ import {
   type MpDetail,
 } from './api.js'
 import { labels, pickLang, type Lang } from './i18n.js'
+import { mountRoutes } from './routes.js'
+export { mountRoutes }
 
 export const name = 'dsh-plugins-mp'
 export const inject = ['tools']
@@ -27,6 +29,8 @@ export interface MpContext {
   tools: {
     register(definition: ReturnType<typeof defineTool>): unknown
   }
+  /** Dynamic injection (core cordis) — used for the web-profile-only HTTP surface. */
+  inject: (deps: string[], fn: (sctx: never) => unknown) => unknown
 }
 
 /** Value object: any JSON shape we return (checked per-field at runtime by the registry). */
@@ -82,6 +86,11 @@ function compatRows(detail: MpDetail, lang: Lang): Array<{ dsh: string; status: 
 
 export function apply(ctx: MpContext, config: MpApiConfig = {}): void {
   const apiBase = resolveApiBase(config)
+
+  // Web-profile-only HTTP surface (host version + one-click install). Headless
+  // profiles keep working: routes mount through dynamic injection and simply
+  // do not appear without a webServer service.
+  mountRoutes(ctx, config)
 
   ctx.tools.register(
     defineTool({
