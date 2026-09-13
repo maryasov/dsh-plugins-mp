@@ -1,10 +1,10 @@
 /**
  * Marketplace API client (host half). Minimal local mirror of the
- * dsh-plugins.vue-z.com response DTOs — the shared types live in the private
+ * dsh-plugins-mp.com response DTOs — the shared types live in the private
  * site repo, the plugin must build standalone.
  */
 
-export const DEFAULT_API_BASE = 'https://dsh-plugins.vue-z.com/api'
+export const DEFAULT_API_BASE = 'https://dsh-plugins-mp.com/api'
 
 export interface MpCard {
   slug: string

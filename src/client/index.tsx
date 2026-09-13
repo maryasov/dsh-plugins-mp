@@ -41,7 +41,7 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-export const API_BASE = 'https://dsh-plugins.vue-z.com/api'
+export const API_BASE = 'https://dsh-plugins-mp.com/api'
 const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
 
@@ -834,7 +834,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context): void {
         sidebar.registerTab({
           id: 'dsh-plugins-mp:catalog',
           title: () => uiLang().title,
-          description: () => 'dsh-plugins.vue-z.com',
+          description: () => 'dsh-plugins-mp.com',
           order: 55,
           single: true,
           component: (tabProps) => <CatalogView {...tabProps} />,
