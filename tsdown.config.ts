@@ -42,6 +42,14 @@ export default [
     sourcemap: true,
     clean: false,
     external: [...PLATFORM_MODULES],
-    outExtensions: () => ({ js: '.js' }),
+    outputOptions: {
+      entryFileNames: 'client.js',
+      // The DSH client loader evaluates each plugin bundle inside a factory
+      // that must self-register via window.__ModuleLoader__.load — bare CJS
+      // output "loads without registering" (see dsh-sentinel's build).
+      banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) => {`,
+      footer: 'return module.exports; } });',
+      intro: 'var module = { exports: {} }; var exports = module.exports;',
+    },
   },
 ]
