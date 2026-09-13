@@ -1,46 +1,46 @@
 # dsh-plugins-mp
 
-Плагин маркетплейса для DeepSeek Harness: кастомная вкладка-каталог в
-[DSH better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) + инструменты
-агентского доступа (`mp_search`, `mp_similar`, `mp_details`, `mp_install`, `mp_trending`)
-поверх API [dsh-plugins.vue-z.com](https://dsh-plugins.vue-z.com).
+DeepSeek Harness plugin marketplace client: a catalog tab for
+[DSH better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) + agent tools
+(`mp_search`, `mp_similar`, `mp_details`, `mp_install`, `mp_trending`) over the API of
+[dsh-plugins.vue-z.com](https://dsh-plugins.vue-z.com).
 
-## Установка
+## Install
 
 ```sh
 dsh plugin --profile web add dsh-plugins-mp
 ```
 
-(после публикации в npm; до того — `add github:maryasov/dsh-plugins-mp`).
+(after the npm release; before that — `add github:maryasov/dsh-plugins-mp`).
 
-Вкладка «Marketplace» появляется в боковой панели, если установлен
-`dsh-better-sidebar` (мягкая зависимость: без него плагин просто не рисует вкладку).
-Host-инструменты работают всегда.
+The "Marketplace" tab appears in the sidebar when `dsh-better-sidebar` is installed
+(soft dependency: without it the plugin just skips the tab). Host-side tools always work.
 
-## Инструменты для агента
+## Agent tools
 
-| Инструмент | Что делает |
+| Tool | What it does |
 |---|---|
-| `mp_search` | поиск по каталогу (текст, категория, профиль, сортировки) + команды установки |
-| `mp_similar` | похожие плагины (векторный поиск) |
-| `mp_details` | полное досье: локализованное описание, версии, совместимость по релизам DSH (автотесты песочницы), теги |
-| `mp_install` | команда `dsh plugin --profile <p> add <source>` (ничего не исполняет сама) |
-| `mp_trending` | популярное: по звёздам / загрузкам / обновлениям |
+| `mp_search` | catalog search (text, category, profile, sorting) + install commands |
+| `mp_similar` | similar plugins (vector search) |
+| `mp_details` | full profile: localized description, versions, per-DSH-release sandbox compatibility, tags |
+| `mp_install` | builds the `dsh plugin --profile <p> add <source>` command (executes nothing) |
+| `mp_trending` | popular plugins: by stars / downloads / updates |
 
-Ответы локализуются (en / zh / ru — параметр `lang`).
+Responses are localized (en / zh / ru via the `lang` parameter).
 
-## Разработка
+## Development
 
 ```sh
 pnpm install
-pnpm build        # tsdown: node half (ESM) + client half (CJS-замыкание)
+pnpm build        # tsdown: node half (ESM) + client half (CJS closure)
 pnpm typecheck
 ```
 
-Проверка в DSH: `dsh plugin --profile mp-test add <путь к репо>` →
-`dsh --profile mp-test --dump-config` (exit 0 = бандл смонтирован).
+Try it in DSH: `dsh plugin --profile mp-test add <path to this repo>` →
+`dsh --profile mp-test --dump-config` (exit 0 = bundle mounted).
 
-Артефакты `lib/` коммитятся: при установке из git сборка не нужна (соглашение
-экосистемы — `@deepseek-ai/*` остаются внешними импортами и резолвятся хостом).
+The `lib/` artifacts are committed, so installing from git requires no build
+(ecosystem convention — `@deepseek-ai/*` stay external and resolve from the host).
 
-Исходники площадки — приватный репозиторий `maryasov/dsh-plugins-marketplace`.
+The marketplace platform sources live in the private repository
+`maryasov/dsh-plugins-marketplace`.
