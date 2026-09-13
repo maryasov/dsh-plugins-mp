@@ -1,0 +1,12 @@
+{
+  "id": "dsh-plugins-mp",
+  "version": "0.1.0",
+  "description": "Plugin marketplace for DeepSeek Harness: browse, search and install community plugins from dsh-plugins.vue-z.com; sidebar catalog tab (dsh-better-sidebar) + agent tools.",
+  "engines": { "dsh": ">=0.1.5-rc.1" },
+  "main": "lib/index.js",
+  "clientMain": "lib/client.js",
+  "contributes": {
+    "tools": ["mp_search", "mp_similar", "mp_details", "mp_install", "mp_trending"],
+    "ui": ["dsh-better-sidebar-tab"]
+  }
+}

@@ -1,0 +1,4 @@
+# dsh-plugins-mp bundle: mount the node half (marketplace agent tools).
+- insert:
+    - id: dsh-plugins-mp
+      name: dsh-plugins-mp
