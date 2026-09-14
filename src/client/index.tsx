@@ -61,6 +61,9 @@ interface MpCard {
   npmDownloadsWeek: number
   license: string | null
   latestVersion: string | null
+  primaryLanguage?: string | null
+  categories?: string[]
+  tags?: string[]
   compat?: Record<string, string>
 }
 
@@ -77,9 +80,11 @@ interface MpDetail {
     originalLang: string
     capabilities: Record<string, boolean>
     deprecatedReason: string | null
+    homepageUrl: string | null
+    sourceUpdatedAt: string | null
     translations: Array<{ locale: string; kind: string; textMd: string; isMachine: boolean }>
   }
-  versions: Array<{ version: string; testRuns?: MpTestRun[] }>
+  versions: Array<{ version: string; publishedAt?: string | null; testRuns?: MpTestRun[] }>
   similar: MpCard[]
 }
 
@@ -142,6 +147,13 @@ const UI = {
     loadMore: 'Load more',
     loading: 'Loading…',
     profile: 'Profile',
+    all: 'All',
+    sortStars: '★ Stars',
+    sortUpdated: 'Updated',
+    sortNewest: 'Newest',
+    sortName: 'Name',
+    updated: 'Updated',
+    versions: 'Versions',
   },
   zh: {
     title: '插件市场',
@@ -165,6 +177,13 @@ const UI = {
     loadMore: '加载更多',
     loading: '加载中…',
     profile: '配置',
+    all: '全部',
+    sortStars: '★ 星数',
+    sortUpdated: '更新时间',
+    sortNewest: '最新',
+    sortName: '名称',
+    updated: '更新于',
+    versions: '版本',
   },
   ru: {
     title: 'Маркетплейс',
@@ -188,15 +207,52 @@ const UI = {
     loadMore: 'Ещё',
     loading: 'Загрузка…',
     profile: 'Профиль',
+    all: 'Все',
+    sortStars: '★ Звёзды',
+    sortUpdated: 'Обновлённые',
+    sortNewest: 'Новые',
+    sortName: 'По имени',
+    updated: 'Обновлено',
+    versions: 'Версии',
   },
 } as const
 
 type UiKey = keyof (typeof UI)['en']
 type UiDict = Record<UiKey, string>
 
-function uiLang(): UiDict {
+type LangCode = 'en' | 'zh' | 'ru'
+
+function langCode(): LangCode {
   const nav = typeof navigator !== 'undefined' ? navigator.language : 'en'
-  return UI[nav.startsWith('zh') ? 'zh' : nav.startsWith('ru') ? 'ru' : 'en'] as UiDict
+  return nav.startsWith('zh') ? 'zh' : nav.startsWith('ru') ? 'ru' : 'en'
+}
+
+function uiLang(): UiDict {
+  return UI[langCode()] as UiDict
+}
+
+// Категории разделяем с сайтом: слаги из @dsh-mp/shared, подписи — как в
+// локализациях dsh-plugins-mp.com (API отдаёт голый слаг в name).
+const CAT_LABELS: Record<string, Record<LangCode, string>> = {
+  ui: { en: 'UI & Experience', zh: '界面与体验', ru: 'Интерфейс и опыт' },
+  themes: { en: 'Themes & Skins', zh: '主题与皮肤', ru: 'Темы и скины' },
+  memory: { en: 'Memory & Context', zh: '记忆与上下文', ru: 'Память и контекст' },
+  sessions: { en: 'Sessions & Messages', zh: '会话与消息', ru: 'Сессии и сообщения' },
+  tools: { en: 'Tools & Capabilities', zh: '工具与能力', ru: 'Инструменты и возможности' },
+  models: { en: 'Models & Providers', zh: '模型与供应商', ru: 'Модели и провайдеры' },
+  workflow: { en: 'Workflow & Automation', zh: '工作流与自动化', ru: 'Автоматизация и воркфлоу' },
+  terminal: { en: 'Terminal & Clients', zh: '终端与客户端', ru: 'Терминал и клиенты' },
+  vision: { en: 'Vision & Multimodal', zh: '视觉与多模态', ru: 'Визуальные и мультимодальные' },
+  notifications: { en: 'Notifications & Integrations', zh: '通知与集成', ru: 'Уведомления и интеграции' },
+  dev: { en: 'Development & Infrastructure', zh: '开发与基础设施', ru: 'Разработка и инфраструктура' },
+  security: { en: 'Security & Audit', zh: '安全与审计', ru: 'Безопасность и аудит' },
+  fun: { en: 'Just for Fun', zh: '娱乐', ru: 'Развлечения' },
+}
+
+const LOCALE_LABEL: Record<string, string> = { en: 'EN', zh: '中文', ru: 'RU' }
+
+function catLabel(slug: string, lang: LangCode): string {
+  return CAT_LABELS[slug]?.[lang] ?? slug
 }
 
 // ---------------------------------------------------------------- styles (token-driven)
@@ -340,6 +396,37 @@ const S: Record<string, React.CSSProperties> = {
     color: 'inherit',
   },
   muted: { opacity: 0.65, fontSize: 12 },
+  chipRow: {
+    display: 'flex',
+    gap: 6,
+    overflowX: 'auto',
+    flexWrap: 'nowrap',
+    paddingBottom: 2,
+    minWidth: 0,
+  },
+  chip: {
+    flexShrink: 0,
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    padding: '3px 10px',
+    borderRadius: 999,
+    border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.35))',
+    background: 'var(--dsw-alias-bg-base, transparent)',
+    color: 'inherit',
+    font: 'inherit',
+    fontSize: 12,
+    cursor: 'pointer',
+    whiteSpace: 'nowrap',
+  },
+  chipOn: {
+    background: 'rgba(79,124,201,0.16)',
+    borderColor: 'rgba(79,124,201,0.55)',
+    fontWeight: 600,
+  },
+  metaRow: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' },
+  link: { color: '#4f7cc9', overflowWrap: 'anywhere' },
+  compatRow: { display: 'flex', gap: 6, alignItems: 'center', margin: '2px 0' },
   backBtn: {
     border: 'none',
     background: 'transparent',
@@ -401,6 +488,18 @@ function avatarStyle(name: string): React.CSSProperties {
   let hash = 0
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0
   return { ...S.avatar, background: AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length] }
+}
+
+function fmtNum(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n)
+}
+
+function fmtDate(iso: string | null | undefined): string | null {
+  if (!iso) return null
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime())
+    ? null
+    : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
 // ---------------------------------------------------------------- markdown (mini)
@@ -606,6 +705,10 @@ function Card(props: { card: MpCard; dshVersion: string | null; onOpen: () => vo
       )}
       <span style={S.cardFoot}>
         {compatBadge(c, props.dshVersion, t)}
+        {c.primaryLanguage != null && <span style={S.badge}>{c.primaryLanguage}</span>}
+        {c.npmDownloadsWeek > 0 && (
+          <span style={S.cardStars}>↓ {fmtNum(c.npmDownloadsWeek)}/wk</span>
+        )}
         <InstallButton slug={c.slug} compact />
       </span>
     </button>
@@ -622,6 +725,9 @@ function CatalogView(props: MpTabProps) {
   const [loading, setLoading] = useState(true)
   const [slug, setSlug] = useState<string | null>(null)
   const [dshVersion, setDshVersion] = useState<string | null>(null)
+  const [cats, setCats] = useState<Array<{ slug: string; count: number }>>([])
+  const [cat, setCat] = useState('')
+  const [sort, setSort] = useState<'stars' | 'updated' | 'newest' | 'name'>('stars')
 
   useEffect(() => {
     // Host version for the "current DSH" compatibility badge. Relative URL —
@@ -633,6 +739,10 @@ function CatalogView(props: MpTabProps) {
         setDshVersion(v !== undefined && v !== 'unknown' ? v : null)
       })
       .catch(() => {})
+    // Category chips with plugin counts.
+    api<Array<{ slug: string; count: number }>>('/categories')
+      .then(setCats)
+      .catch(() => {})
   }, [])
 
   const load = (q: string, nextPage: number, replace: boolean) => {
@@ -640,6 +750,8 @@ function CatalogView(props: MpTabProps) {
     setLoading(true)
     const usp = new URLSearchParams({ limit: '25', page: String(nextPage), installable: '1' })
     if (q !== '') usp.set('q', q)
+    if (cat !== '') usp.set('category', cat)
+    usp.set('sort', sort)
     api<{ items: MpCard[]; total: number }>(`/plugins?${usp.toString()}`, ctrl.signal)
       .then((d) => {
         setItems((prev) => (replace ? d.items : [...prev, ...d.items]))
@@ -655,7 +767,7 @@ function CatalogView(props: MpTabProps) {
     if (slug !== null) return
     return load(query, 1, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slug])
+  }, [slug, cat, sort])
 
   return (
     <div style={S.root}>
@@ -681,6 +793,36 @@ function CatalogView(props: MpTabProps) {
                 onChange={(e) => setQuery(e.target.value)}
               />
             </form>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <div style={{ ...S.chipRow, flex: 1 }}>
+                <button
+                  style={{ ...S.chip, ...(cat === '' ? S.chipOn : {}) }}
+                  onClick={() => setCat('')}
+                >
+                  {t.all}
+                </button>
+                {cats.map((c) => (
+                  <button
+                    key={c.slug}
+                    style={{ ...S.chip, ...(cat === c.slug ? S.chipOn : {}) }}
+                    onClick={() => setCat(c.slug)}
+                  >
+                    {catLabel(c.slug, langCode())}{' '}
+                    <span style={{ opacity: 0.6 }}>{c.count}</span>
+                  </button>
+                ))}
+              </div>
+              <select
+                style={S.select}
+                value={sort}
+                onChange={(e) => setSort(e.target.value as typeof sort)}
+              >
+                <option value="stars">{t.sortStars}</option>
+                <option value="updated">{t.sortUpdated}</option>
+                <option value="newest">{t.sortNewest}</option>
+                <option value="name">{t.sortName}</option>
+              </select>
+            </div>
           </div>
           <div style={S.list}>
             <div style={S.grid}>
@@ -718,11 +860,13 @@ function DetailView(props: {
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [profile, setProfile] = useState('web')
+  const [descLoc, setDescLoc] = useState<string | null>(null)
 
   useEffect(() => {
     const ctrl = new AbortController()
     setDetail(null)
     setError(null)
+    setDescLoc(null)
     api<MpDetail>(`/plugins/${encodeURIComponent(props.slug)}`, ctrl.signal)
       .then(setDetail)
       .catch((e) => {
@@ -736,14 +880,35 @@ function DetailView(props: {
 
   const p = detail.plugin
   const cmd = installCommandFor(p, profile)
-  const tr = p.translations.find((x) => x.kind === 'description' && !x.isMachine)
-    ?? p.translations.find((x) => x.kind === 'description')
-  const desc = tr?.textMd !== undefined && tr.textMd !== '' ? tr.textMd : p.descriptionMd
+  // Description locales: original first, then translations; a human
+  // translation wins over a machine one for the same locale.
+  const descLocales: Array<{ locale: string; isMachine: boolean; text: string }> = [
+    { locale: p.originalLang, isMachine: false, text: p.descriptionMd },
+  ]
+  for (const x of p.translations) {
+    if (x.kind !== 'description' || x.textMd.trim() === '') continue
+    const hit = descLocales.find((o) => o.locale === x.locale)
+    if (hit === undefined) {
+      descLocales.push({ locale: x.locale, isMachine: x.isMachine, text: x.textMd })
+    } else if (hit.isMachine && !x.isMachine) {
+      hit.isMachine = false
+      hit.text = x.textMd
+    }
+  }
+  const lang = langCode()
+  const activeLoc = descLoc ?? (descLocales.some((o) => o.locale === lang) ? lang : p.originalLang)
+  const activeDesc = descLocales.find((o) => o.locale === activeLoc)
+  const desc = activeDesc?.text ?? ''
   const runs = detail.versions[0]?.testRuns ?? []
   const currentRun = props.dshVersion !== null
     ? runs.find((r) => r.dshRelease === props.dshVersion)
     : undefined
-  const otherRuns = runs.filter((r) => r.dshRelease !== props.dshVersion)
+  const seenReleases = new Set<string>()
+  const otherRuns = runs.filter((r) => {
+    if (r.dshRelease === props.dshVersion || seenReleases.has(r.dshRelease)) return false
+    seenReleases.add(r.dshRelease)
+    return true
+  })
   const similar = detail.similar
 
   return (
@@ -762,6 +927,42 @@ function DetailView(props: {
           {p.latestVersion ?? ''}
           {p.license !== null ? ` · ${p.license}` : ''}
         </div>
+        <div style={{ ...S.muted, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          {p.primaryLanguage != null && <span>{p.primaryLanguage}</span>}
+          {p.npmDownloadsWeek > 0 && <span>↓ {fmtNum(p.npmDownloadsWeek)}/wk</span>}
+          {fmtDate(p.sourceUpdatedAt) !== null && (
+            <span>{t.updated}: {fmtDate(p.sourceUpdatedAt)}</span>
+          )}
+        </div>
+        {((p.categories?.length ?? 0) > 0 || (p.tags?.length ?? 0) > 0) && (
+          <div style={S.metaRow}>
+            {p.categories?.map((c) => (
+              <span key={c} style={{ ...S.badge, ...S.chipOn }}>{catLabel(c, langCode())}</span>
+            ))}
+            {p.tags?.slice(0, 8).map((tg) => (
+              <span key={tg} style={S.badge}>{tg}</span>
+            ))}
+          </div>
+        )}
+        {(p.repoOwner != null || p.homepageUrl != null) && (
+          <div style={{ ...S.metaRow, fontSize: 12 }}>
+            {p.repoOwner != null && p.repoName != null && (
+              <a
+                style={S.link}
+                href={`https://github.com/${p.repoOwner}/${p.repoName}`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                GitHub ↗
+              </a>
+            )}
+            {p.homepageUrl != null && (
+              <a style={S.link} href={p.homepageUrl} target="_blank" rel="noreferrer">
+                {p.homepageUrl}
+              </a>
+            )}
+          </div>
+        )}
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <InstallButton slug={p.slug} profile={profile} />
           <select style={S.select} value={profile} onChange={(e) => setProfile(e.target.value)}>
@@ -787,23 +988,55 @@ function DetailView(props: {
         {p.deprecatedReason !== null && <div style={S.err}>{p.deprecatedReason}</div>}
       </div>
       <div style={S.body}>
-        {props.dshVersion !== null && (
-          <div style={{ marginBottom: 10 }}>
-            <div style={S.muted}>
-              {t.compatibility} — DSH {props.dshVersion} ({t.current})
-            </div>
-            <span style={{ ...S.badge, ...BADGE_TONE[currentRun?.status ?? 'unknown'] }}>
-              DSH {props.dshVersion}:{' '}
-              {currentRun === undefined ? t.notTested : t[STATUS_KEY[currentRun.status] ?? 'notTested']}
-            </span>
-            {otherRuns.length > 0 && (
-              <span style={{ ...S.badge, ...BADGE_TONE.unknown, marginLeft: 6 }}>
-                {otherRuns.map((r) => `${r.dshRelease}: ${t[STATUS_KEY[r.status] ?? 'notTested']}`).join(' · ')}
-              </span>
+        {(props.dshVersion !== null || otherRuns.length > 0) && (
+          <div style={{ marginBottom: 12 }}>
+            <div style={S.muted}>{t.compatibility}</div>
+            {props.dshVersion !== null && (
+              <div style={S.compatRow}>
+                <span style={S.badge}>DSH {props.dshVersion} · {t.current}</span>
+                <span style={{ ...S.badge, ...BADGE_TONE[currentRun?.status ?? 'unknown'] }}>
+                  {currentRun === undefined
+                    ? t.notTested
+                    : t[STATUS_KEY[currentRun.status] ?? 'notTested']}
+                </span>
+              </div>
             )}
+            {otherRuns.map((r) => (
+              <div key={r.dshRelease} style={S.compatRow}>
+                <span style={S.badge}>DSH {r.dshRelease}</span>
+                <span style={{ ...S.badge, ...BADGE_TONE[r.status] }}>
+                  {t[STATUS_KEY[r.status] ?? 'notTested']}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+        {descLocales.length > 1 && (
+          <div style={{ ...S.metaRow, marginBottom: 6 }}>
+            {descLocales.map((o) => (
+              <button
+                key={o.locale}
+                style={{ ...S.chip, ...(o.locale === activeLoc ? S.chipOn : {}) }}
+                title={o.isMachine ? '⚙ machine translation' : undefined}
+                onClick={() => setDescLoc(o.locale)}
+              >
+                {LOCALE_LABEL[o.locale] ?? o.locale}{o.isMachine ? ' ⚙' : ''}
+              </button>
+            ))}
           </div>
         )}
         {desc !== '' ? <Markdown source={desc} /> : <div style={S.muted}>{t.empty}</div>}
+        {detail.versions.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div style={S.muted}>{t.versions}</div>
+            {detail.versions.slice(0, 6).map((v) => (
+              <div key={v.version} style={{ display: 'flex', gap: 8, alignItems: 'baseline', margin: '2px 0' }}>
+                <code style={S.code}>{v.version}</code>
+                <span style={S.muted}>{fmtDate(v.publishedAt) ?? ''}</span>
+              </div>
+            ))}
+          </div>
+        )}
         {similar.length > 0 && (
           <div style={{ marginTop: 16 }}>
             <div style={S.muted}>{t.similar}</div>
