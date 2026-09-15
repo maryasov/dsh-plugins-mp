@@ -793,15 +793,51 @@ function CatalogView(props: MpTabProps) {
   const autoRefetches = useRef(0)
   const refetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const load = (q: string, nextPage: number, replace: boolean, auto = false) => {
-    // A new load always supersedes a scheduled auto-refetch (params changed).
+  const clearRefetch = () => {
     if (refetchTimer.current !== null) {
       clearTimeout(refetchTimer.current)
       refetchTimer.current = null
     }
-    if (!auto) autoRefetches.current = 0
+  }
+
+  // Тихий дозапрос уже загруженных страниц, пока у сервера есть недопереведённые
+  // карточки (pendingShort). Обновление точечное: существующие карточки замещаются
+  // по slug, порядок и состав списка не меняются — дублей быть не может в отличие
+  // от перезапуска load() с append-режимом (каждый полл дублировал страницу).
+  const refreshTranslated = (q: string, upToPage: number) => {
+    const pages = Array.from({ length: upToPage }, (_, i) => i + 1)
+    Promise.all(
+      pages.map((p) => {
+        const usp = new URLSearchParams({ limit: '25', page: String(p), installable: '1' })
+        if (q !== '') usp.set('q', q)
+        if (cat !== '') usp.set('category', cat)
+        usp.set('sort', sort)
+        usp.set('locale', langCode())
+        return api<{ items: MpCard[]; pendingShort?: number }>(`/plugins?${usp.toString()}`)
+      }),
+    )
+      .then((results) => {
+        const bySlug = new Map<string, MpCard>()
+        let pending = 0
+        for (const r of results) {
+          pending += r.pendingShort ?? 0
+          for (const c of r.items) bySlug.set(c.slug, c)
+        }
+        setItems((prev) => prev.map((c) => bySlug.get(c.slug) ?? c))
+        if (pending > 0 && autoRefetches.current < AUTO_REFETCH_MAX) {
+          autoRefetches.current += 1
+          refetchTimer.current = setTimeout(() => refreshTranslated(q, upToPage), AUTO_REFETCH_MS)
+        }
+      })
+      .catch(() => {})
+  }
+
+  const load = (q: string, nextPage: number, replace: boolean) => {
+    // Новый (ручной) загруз отменяет запланированный дозапрос: параметры меняются.
+    clearRefetch()
+    autoRefetches.current = 0
     const ctrl = new AbortController()
-    if (!auto) setLoading(true)
+    setLoading(true)
     const usp = new URLSearchParams({ limit: '25', page: String(nextPage), installable: '1' })
     if (q !== '') usp.set('q', q)
     if (cat !== '') usp.set('category', cat)
@@ -817,19 +853,14 @@ function CatalogView(props: MpTabProps) {
         setPage(nextPage)
         if ((d.pendingShort ?? 0) > 0 && autoRefetches.current < AUTO_REFETCH_MAX) {
           autoRefetches.current += 1
-          refetchTimer.current = setTimeout(() => load(q, nextPage, replace, true), AUTO_REFETCH_MS)
+          refetchTimer.current = setTimeout(() => refreshTranslated(q, nextPage), AUTO_REFETCH_MS)
         }
       })
       .catch(() => {})
-      .finally(() => {
-        if (!auto) setLoading(false)
-      })
+      .finally(() => setLoading(false))
     return () => {
       ctrl.abort()
-      if (refetchTimer.current !== null) {
-        clearTimeout(refetchTimer.current)
-        refetchTimer.current = null
-      }
+      clearRefetch()
     }
   }
 
