@@ -12,7 +12,10 @@
  *   sandboxed executor that denies profile writes — same reasoning as
  *   dsh-market). One install at a time.
  */
+import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { CONFIG_ROUTE, fetchDetail, installSourceFor, resolveApiBase, type MpApiConfig } from './api.js'
 import { dshHostInfo } from './host-info.js'
 
@@ -90,12 +93,73 @@ export interface InstallOutcome {
   timedOut: boolean
 }
 
+/**
+ * Как dsh-market (src/dsh-cli.ts): предпочтительный способ запуска CLI —
+ * переиспользовать энтри ЗАПУЩЕННОГО dsh (process.argv[1], обычно
+ * apps/cli/src/bin.ts): версия и окружение гарантированно совпадают с хостом,
+ * и мы не зависим от шима ~/.local/bin/dsh, жёстко подменяющего PATH.
+ * Фолбэки: `dsh` из PATH, затем ~/.local/bin/dsh.
+ */
+interface DshCommand {
+  argv: string[]
+  cwd?: string
+  label: string
+}
+
+/** Каталог, из которого разрешится `--import tsx/esm` (корень чекаута с node_modules). */
+function moduleRootFor(entry: string): string {
+  let dir = dirname(entry)
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(join(dir, 'node_modules', 'tsx'))) return dir
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return dirname(entry)
+}
+
+export function dshCommands(): DshCommand[] {
+  const cmds: DshCommand[] = []
+  const override = process.env.DSH_MP_DSH_BIN
+  if (override) cmds.push({ argv: [override], label: override })
+  const entry = process.argv[1] ?? ''
+  if (/(?:bin\.(?:js|ts)|dsh)$/.test(entry)) {
+    cmds.push({
+      argv: [process.execPath, ...process.execArgv, entry],
+      cwd: moduleRootFor(entry),
+      label: `node … ${entry}`,
+    })
+  }
+  cmds.push({ argv: ['dsh'], label: 'dsh (PATH)' })
+  cmds.push({ argv: [join(homedir(), '.local', 'bin', 'dsh')], label: '~/.local/bin/dsh' })
+  return cmds
+}
+
+/**
+ * PATH-repair (dsh-market spawnEnv): у процесса, обслуживающего плагин
+ * (systemd-юнит, GUI-лаунчер), PATH урезан, а `pnpm` может разрешиться в
+ * corepack-шим со старой дефолтной версией — тогда установка в профиль идёт
+ * чужим pnpm и падает ERR_PNPM_UNEXPECTED_STORE (store v10 против v11).
+ * Поэтому /usr/sbin (реальный pnpm 11) ставим раньше shim-каталогов.
+ * CI=true — pnpm не ждёт ответа на TTY-вопросах в headless-окружении.
+ */
+function spawnEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PATH: `/usr/sbin:${dirname(process.execPath)}:${process.env.PATH ?? ''}`,
+    CI: 'true',
+    GIT_TERMINAL_PROMPT: '0',
+  }
+}
+
 export function runDshPluginAdd(
   profile: string,
   source: string,
   timeoutMs = INSTALL_TIMEOUT_MS,
 ): Promise<InstallOutcome> {
   const command = `dsh plugin --profile ${profile} add ${source}`
+  const commands = dshCommands()
+  const env = spawnEnv()
   return new Promise((resolve) => {
     let output = ''
     let timedOut = false
@@ -103,30 +167,49 @@ export function runDshPluginAdd(
       output += buf.toString('utf8')
       if (output.length > MAX_OUTPUT_CHARS) output = output.slice(-MAX_OUTPUT_CHARS)
     }
-    let child: ReturnType<typeof spawn>
-    try {
-      child = spawn('dsh', ['plugin', '--profile', profile, 'add', source], {
-        env: process.env,
+    const attempt = (index: number): void => {
+      if (index >= commands.length) {
+        resolve({
+          ok: false,
+          code: null,
+          command,
+          source,
+          output: `dsh CLI not found (tried: ${commands.map((c) => c.label).join(', ')}). ` +
+            'Set DSH_MP_DSH_BIN or put dsh on the PATH of the DSH process.',
+          timedOut: false,
+        })
+        return
+      }
+      const cmd = commands[index]
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const child = spawn(cmd.argv[0], [...cmd.argv.slice(1), 'plugin', '--profile', profile, 'add', source], {
+        cwd: cmd.cwd,
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
-    } catch (error) {
-      resolve({ ok: false, code: null, command, source, output: String(error), timedOut: false })
-      return
+      child.stdout?.on('data', collect)
+      child.stderr?.on('data', collect)
+      // ENOENT → this binary is missing in the serving environment: fall
+      // through to the next candidate instead of failing the install.
+      child.on('error', (error: NodeJS.ErrnoException) => {
+        if (timer) clearTimeout(timer)
+        if (error.code === 'ENOENT' && index < commands.length - 1) {
+          child.removeAllListeners('close')
+          attempt(index + 1)
+          return
+        }
+        resolve({ ok: false, code: null, command, source, output: `${output}\n${String(error)}`.trim(), timedOut })
+      })
+      timer = setTimeout(() => {
+        timedOut = true
+        child.kill('SIGKILL')
+      }, timeoutMs)
+      child.on('close', (code) => {
+        if (timer) clearTimeout(timer)
+        resolve({ ok: code === 0 && !timedOut, code, command, source, output: output.trim(), timedOut })
+      })
     }
-    child.stdout?.on('data', collect)
-    child.stderr?.on('data', collect)
-    const timer = setTimeout(() => {
-      timedOut = true
-      child.kill('SIGKILL')
-    }, timeoutMs)
-    child.on('error', (error) => {
-      clearTimeout(timer)
-      resolve({ ok: false, code: null, command, source, output: `${output}\n${String(error)}`.trim(), timedOut })
-    })
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      resolve({ ok: code === 0 && !timedOut, code, command, source, output: output.trim(), timedOut })
-    })
+    attempt(0)
   })
 }
 
