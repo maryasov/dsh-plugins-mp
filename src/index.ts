@@ -1,6 +1,6 @@
 /**
  * dsh-plugins-mp, node half: model-facing tools over the marketplace API
- * (dsh-plugins.vue-z.com). Registered through ctx.tools.register(defineTool)
+ * (dsh-plugins-mp.com). Registered through ctx.tools.register(defineTool)
  * per the DSH tool-authoring contract; the plugin stays a thin API adapter —
  * no execution, no persistence.
  */
@@ -96,7 +96,7 @@ export function apply(ctx: MpContext, config: MpApiConfig = {}): void {
     defineTool({
       name: 'mp_search',
       description:
-        `Search the DeepSeek Harness plugin marketplace (dsh-plugins.vue-z.com, ${DEFAULT_API_BASE}). ` +
+        `Search the DeepSeek Harness plugin marketplace (dsh-plugins-mp.com, ${DEFAULT_API_BASE}). ` +
         `Returns name, stars, short description and the exact install command for each match. ` +
         `Use when the user asks to find/discover plugins, or before installing anything.`,
       parameters: {
