@@ -259,9 +259,50 @@ type UiDict = Record<UiKey, string>
 
 type LangCode = 'en' | 'zh' | 'ru'
 
-function langCode(): LangCode {
+function navLang(): LangCode {
   const nav = typeof navigator !== 'undefined' ? navigator.language : 'en'
   return nav.startsWith('zh') ? 'zh' : nav.startsWith('ru') ? 'ru' : 'en'
+}
+
+/** Язык интерфейса DSH: веб-приложение выставляет его в lang на <html> ("ru-RU"). */
+function dshLang(): LangCode | null {
+  if (typeof document === 'undefined') return null
+  const l = (document.documentElement.getAttribute('lang') ?? '').slice(0, 2).toLowerCase()
+  return l === 'en' || l === 'zh' || l === 'ru' ? (l as LangCode) : null
+}
+
+function langCode(): LangCode {
+  return dshLang() ?? navLang()
+}
+
+let langSubscribers: Set<() => void> | null = null
+
+function watchDshLang(cb: () => void): () => void {
+  if (typeof document === 'undefined') return () => {}
+  if (langSubscribers === null) {
+    langSubscribers = new Set()
+    // Один общий обсервер: DSH меняет атрибут lang на <html> при переключении
+    // языка интерфейса — все подписчики (список, карточки, детали) узнают об
+    // этом без собственных обсерверов.
+    new MutationObserver(() => {
+      for (const fn of langSubscribers!) fn()
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] })
+  }
+  langSubscribers.add(cb)
+  return () => {
+    langSubscribers!.delete(cb)
+  }
+}
+
+/** Реактивный язык интерфейса: следует за переключением языка в DSH. */
+function useUiLang(): LangCode {
+  const [lang, setLang] = useState<LangCode>(() => langCode())
+  useEffect(() => {
+    const sync = (): void => setLang(langCode())
+    sync()
+    return watchDshLang(sync)
+  }, [])
+  return lang
 }
 
 function uiLang(): UiDict {
@@ -754,7 +795,8 @@ function Card(props: { card: MpCard; dshVersion: string | null; onOpen: () => vo
 
 function CatalogView(props: MpTabProps) {
   void props
-  const t = uiLang()
+  const uiLangCode = useUiLang()
+  const t = UI[uiLangCode] as UiDict
   const [query, setQuery] = useState('')
   const [items, setItems] = useState<MpCard[]>([])
   const [total, setTotal] = useState(0)
@@ -870,6 +912,20 @@ function CatalogView(props: MpTabProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug, cat, sort])
 
+  // Переключение языка интерфейса DSH (html lang): тихо переводим уже
+  // загруженные карточки под новый язык. Дозапрос тех же страниц мерджится
+  // по slug, а заодно ставит серверу задачи на недостающие переводы —
+  // дальше работает обычная цепочка auto-refetch (pendingShort).
+  const prevUiLang = useRef(uiLangCode)
+  useEffect(() => {
+    if (prevUiLang.current === uiLangCode) return
+    prevUiLang.current = uiLangCode
+    if (slug !== null) return
+    autoRefetches.current = 0
+    refreshTranslated(query, page)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uiLangCode])
+
   return (
     <div style={S.root}>
       {slug !== null ? (
@@ -909,7 +965,7 @@ function CatalogView(props: MpTabProps) {
                     style={{ ...S.chip, ...(cat === c.slug ? S.chipOn : {}) }}
                     onClick={() => setCat(c.slug)}
                   >
-                    {catLabel(c.slug, langCode())}{' '}
+                    {catLabel(c.slug, uiLangCode)}{' '}
                     <span style={{ opacity: 0.6 }}>{c.count}</span>
                   </button>
                 ))}
@@ -957,7 +1013,8 @@ function DetailView(props: {
   onBack: () => void
   onOpenSlug: (slug: string) => void
 }) {
-  const t = uiLang()
+  const uiLangCode = useUiLang()
+  const t = UI[uiLangCode] as UiDict
   const [detail, setDetail] = useState<MpDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
@@ -997,7 +1054,7 @@ function DetailView(props: {
       hit.text = x.textMd
     }
   }
-  const lang = langCode()
+  const lang = uiLangCode
   const activeLoc = descLoc ?? (descLocales.some((o) => o.locale === lang) ? lang : p.originalLang)
   const activeDesc = descLocales.find((o) => o.locale === activeLoc)
   const desc = activeDesc?.text ?? ''
@@ -1039,7 +1096,7 @@ function DetailView(props: {
         {((p.categories?.length ?? 0) > 0 || (p.tags?.length ?? 0) > 0) && (
           <div style={S.metaRow}>
             {p.categories?.map((c) => (
-              <span key={c} style={{ ...S.badge, ...S.chipOn }}>{catLabel(c, langCode())}</span>
+              <span key={c} style={{ ...S.badge, ...S.chipOn }}>{catLabel(c, uiLangCode)}</span>
             ))}
             {p.tags?.slice(0, 8).map((tg) => (
               <span key={tg} style={S.badge}>{tg}</span>
