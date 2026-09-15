@@ -3,7 +3,7 @@
 DeepSeek Harness plugin marketplace client: a catalog tab for
 [DSH better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) + agent tools
 (`mp_search`, `mp_similar`, `mp_details`, `mp_install`, `mp_trending`) over the API of
-[dsh-plugins.vue-z.com](https://dsh-plugins.vue-z.com).
+[dsh-plugins-mp.com](https://dsh-plugins-mp.com).
 
 ## Install
 
