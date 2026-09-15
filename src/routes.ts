@@ -3,6 +3,9 @@
  * ctx.inject(['webServer']) pattern — headless profiles skip it):
  *
  * - GET  /plugins/dsh-plugins-mp/host    → { dsh: { version } | null }
+ * - GET  /plugins/dsh-plugins-mp/config  → { apiBase } — resolved backend the
+ *   browser half should use (host resolves config/env/.env once, browser is
+ *   same-origin to it).
  * - POST /plugins/dsh-plugins-mp/install → body { slug, profile, dry? };
  *   resolves the install source from the marketplace API and re-invokes the
  *   `dsh plugin` CLI (child_process, NOT ctx.shell: the agent shell is a
@@ -10,7 +13,7 @@
  *   dsh-market). One install at a time.
  */
 import { spawn } from 'node:child_process'
-import { fetchDetail, installSourceFor, resolveApiBase, type MpApiConfig } from './api.js'
+import { CONFIG_ROUTE, fetchDetail, installSourceFor, resolveApiBase, type MpApiConfig } from './api.js'
 import { dshHostInfo } from './host-info.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
@@ -160,6 +163,16 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // Expose the resolved backend so the browser half (which can't read
+      // config/.env/process.env) fetches from the same API it should talk to.
+      const stopConfig = webServer.register({
+        kind: 'exact',
+        path: CONFIG_ROUTE,
+        handler: (_req, res) => {
+          json(res, 200, { apiBase })
+        },
+      })
+
       const stopInstall = webServer.register({
         kind: 'exact',
         path: INSTALL_ROUTE,
@@ -214,6 +227,7 @@ export function mountRoutes(ctx: {
 
       return () => {
         stopHost()
+        stopConfig()
         stopInstall()
       }
     }, 'dsh-plugins-mp: host routes')

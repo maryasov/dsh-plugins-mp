@@ -4,6 +4,10 @@
  * site repo, the plugin must build standalone.
  */
 
+import { readFileSync, realpathSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 export const DEFAULT_API_BASE = 'https://dsh-plugins-mp.com/api'
 
 export interface MpCard {
@@ -79,9 +83,75 @@ export interface MpApiConfig {
   apiBase?: string
 }
 
+export const CONFIG_ROUTE = '/plugins/dsh-plugins-mp/config'
+
+/**
+ * Parse a `.env`-style file (KEY=value, ignoring blanks, # comments and
+ * surrounding quotes). Used to let the plugin pick up a local backend override
+ * without shipping one — no `.env` in the plugin folder means we fall back to
+ * the hosting backend (DEFAULT_API_BASE).
+ */
+export function parseDotEnv(contents: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const rawLine of contents.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (line === '' || line.startsWith('#')) continue
+    const eq = line.indexOf('=')
+    if (eq === -1) continue
+    const key = line.slice(0, eq).trim()
+    let val = line.slice(eq + 1).trim()
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1)
+    }
+    if (key) out[key] = val
+  }
+  return out
+}
+
+/**
+ * Absolute path to the plugin's own folder, where a local `.env` may live.
+ * `process.env.DMP_PLUGIN_DIR` lets callers (and tests) point at a specific
+ * folder; otherwise we resolve it from this bundled module's own location via
+ * `import.meta.url` — works whether the plugin is installed from a local path
+ * or a git clone.
+ */
+export function pluginDir(): string {
+  if (process.env.DMP_PLUGIN_DIR) return process.env.DMP_PLUGIN_DIR
+  const here = dirname(fileURLToPath(import.meta.url))
+  try {
+    return dirname(realpathSync(here))
+  } catch {
+    return join(here, '..')
+  }
+}
+
+/** Value of a backend override from a local `.env`, or undefined if absent. */
+export function localDotEnvApiBase(): string | undefined {
+  try {
+    const contents = readFileSync(join(pluginDir(), '.env'), 'utf8')
+    return parseDotEnv(contents)['DSH_MP_API_URL']
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Normalize a backend base for the `/api`-prefixed client. Strips trailing
+ * slashes and, for absolute URLs that omit the `/api` segment, appends it — so
+ * `DSH_MP_API_URL=https://dev.dsh-plugins-mp.com` and
+ * `.../api` both resolve correctly. The `/api` path is required because the API
+ * server is reached via `dev.dsh-plugins-mp.com/api` (nginx strips it → :4000).
+ */
+export function normalizeApiBase(base: string): string {
+  let b = base.replace(/\/+$/, '')
+  if (/^https?:\/\//i.test(b) && !/\/api\b/.test(b)) b += '/api'
+  return b
+}
+
 export function resolveApiBase(config?: MpApiConfig): string {
-  const base = config?.apiBase ?? process.env.DSH_MP_API_URL ?? DEFAULT_API_BASE
-  return base.replace(/\/+$/, '')
+  const base =
+    config?.apiBase ?? process.env.DSH_MP_API_URL ?? localDotEnvApiBase() ?? DEFAULT_API_BASE
+  return normalizeApiBase(base)
 }
 
 async function api<T>(base: string, path: string, signal?: AbortSignal): Promise<T> {

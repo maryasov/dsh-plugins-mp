@@ -1,2 +1,4 @@
 node_modules/
 *.tsbuildinfo
+# Local backend override for rapid marketplace testing — machine-specific, never commit.
+.env
