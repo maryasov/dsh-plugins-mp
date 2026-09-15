@@ -14,6 +14,7 @@
  */
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
+import { BrandMark } from './brand'
 
 interface MpTabProps {
   readonly visible: boolean
@@ -41,9 +42,44 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-export const API_BASE = 'https://dsh-plugins-mp.com/api'
+// The resolved backend. The browser half can't read config/.env/process.env, so
+// the host half resolves it once and serves it at CONFIG_ROUTE (same origin); we
+// adopt it on mount and fall back to the hosting backend below.
+let API_BASE = 'https://dsh-plugins-mp.com/api'
+const API_BASE_DEFAULT = 'https://dsh-plugins-mp.com/api'
+const CONFIG_ROUTE = '/plugins/dsh-plugins-mp/config'
 const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
+
+// The client appends /plugins, /categories, … to the base, so it must carry the
+// /api segment the API server is reached under (dev.dsh-plugins-mp.com/api →
+// nginx strips it → :4000). Tolerate a value that omits /api.
+function normalizeBase(base: string): string {
+  let b = base.replace(/\/+$/, '')
+  if (/^https?:\/\//i.test(b) && !/\/api\b/.test(b)) b += '/api'
+  return b
+}
+
+// Fetch the resolved backend once and remember it. Never throws — on any
+// failure we keep the hosting backend so the tab always works. Memoized by
+// promise so concurrent callers share a single /config fetch.
+let basePromise: Promise<void> | null = null
+function ensureApiBase(): Promise<void> {
+  if (basePromise === null) {
+    basePromise = (async () => {
+      try {
+        const res = await fetch(CONFIG_ROUTE, { headers: { accept: 'application/json' } })
+        if (res.ok) {
+          const { apiBase } = await res.json()
+          if (typeof apiBase === 'string' && apiBase.length) API_BASE = normalizeBase(apiBase)
+        }
+      } catch {
+        // stay on the hosting backend
+      }
+    })()
+  }
+  return basePromise
+}
 
 // ---------------------------------------------------------------- API (client-side mirror)
 
@@ -89,6 +125,7 @@ interface MpDetail {
 }
 
 async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
+  await ensureApiBase()
   const res = await fetch(`${API_BASE}${path}`, { headers: { accept: 'application/json' }, signal })
   if (!res.ok) throw new Error(`${res.status}`)
   return (await res.json()) as T
@@ -752,6 +789,7 @@ function CatalogView(props: MpTabProps) {
     if (q !== '') usp.set('q', q)
     if (cat !== '') usp.set('category', cat)
     usp.set('sort', sort)
+    usp.set('locale', langCode())
     api<{ items: MpCard[]; total: number }>(`/plugins?${usp.toString()}`, ctrl.signal)
       .then((d) => {
         setItems((prev) => (replace ? d.items : [...prev, ...d.items]))
@@ -777,7 +815,8 @@ function CatalogView(props: MpTabProps) {
         <>
           <div style={S.header}>
             <div style={S.titleRow}>
-              🧩 {t.title}
+              <BrandMark size={18} />
+              {t.title}
               {dshVersion !== null && <span style={S.hostBadge}>DSH {dshVersion}</span>}
             </div>
             <form
@@ -1068,6 +1107,10 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context): void {
           id: 'dsh-plugins-mp:catalog',
           title: () => uiLang().title,
           description: () => 'dsh-plugins-mp.com',
+          // better-sidebar renders this in the tab strip (14) and in the +
+          // new-tab menu / pane cards (14); it picks up the theme on flips
+          // via the shared data-ds-dark-theme observer in brand.tsx.
+          icon: (size: number) => <BrandMark size={size} />,
           order: 55,
           single: true,
           component: (tabProps) => <CatalogView {...tabProps} />,
