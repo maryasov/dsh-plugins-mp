@@ -12,7 +12,7 @@
  * it activates whenever the service lands and never blocks web boot on hosts
  * without better-sidebar.
  */
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { BrandMark } from './brand'
 
@@ -782,23 +782,55 @@ function CatalogView(props: MpTabProps) {
       .catch(() => {})
   }, [])
 
-  const load = (q: string, nextPage: number, replace: boolean) => {
+  // Short-description translations are produced by the server asynchronously
+  // (LLM queue, seconds per plugin). A page response reports pendingShort —
+  // the number of cards still showing their original text — and we quietly
+  // refetch the same query until it reaches zero, so cards flip to the UI
+  // language without any user action. Capped so a broken backend can't spin
+  // the tab forever.
+  const AUTO_REFETCH_MS = 8000
+  const AUTO_REFETCH_MAX = 10
+  const autoRefetches = useRef(0)
+  const refetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const load = (q: string, nextPage: number, replace: boolean, auto = false) => {
+    // A new load always supersedes a scheduled auto-refetch (params changed).
+    if (refetchTimer.current !== null) {
+      clearTimeout(refetchTimer.current)
+      refetchTimer.current = null
+    }
+    if (!auto) autoRefetches.current = 0
     const ctrl = new AbortController()
-    setLoading(true)
+    if (!auto) setLoading(true)
     const usp = new URLSearchParams({ limit: '25', page: String(nextPage), installable: '1' })
     if (q !== '') usp.set('q', q)
     if (cat !== '') usp.set('category', cat)
     usp.set('sort', sort)
     usp.set('locale', langCode())
-    api<{ items: MpCard[]; total: number }>(`/plugins?${usp.toString()}`, ctrl.signal)
+    api<{ items: MpCard[]; total: number; pendingShort?: number }>(
+      `/plugins?${usp.toString()}`,
+      ctrl.signal,
+    )
       .then((d) => {
         setItems((prev) => (replace ? d.items : [...prev, ...d.items]))
         setTotal(d.total)
         setPage(nextPage)
+        if ((d.pendingShort ?? 0) > 0 && autoRefetches.current < AUTO_REFETCH_MAX) {
+          autoRefetches.current += 1
+          refetchTimer.current = setTimeout(() => load(q, nextPage, replace, true), AUTO_REFETCH_MS)
+        }
       })
       .catch(() => {})
-      .finally(() => setLoading(false))
-    return () => ctrl.abort()
+      .finally(() => {
+        if (!auto) setLoading(false)
+      })
+    return () => {
+      ctrl.abort()
+      if (refetchTimer.current !== null) {
+        clearTimeout(refetchTimer.current)
+        refetchTimer.current = null
+      }
+    }
   }
 
   useEffect(() => {
