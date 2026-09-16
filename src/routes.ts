@@ -59,6 +59,16 @@ import {
   unportableDeps,
   validatedBackup,
 } from './backup.js'
+import {
+  createGist,
+  downloadWebdav,
+  parseGistId,
+  readGist,
+  resolveGistToken,
+  updateGist,
+  uploadWebdav,
+  verifyGistToken,
+} from './sync-backup.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
@@ -77,6 +87,7 @@ export const TOGGLE_ROUTE = '/plugins/dsh-plugins-mp/toggle'
 export const GROUP_ROUTE = '/plugins/dsh-plugins-mp/group'
 export const ORDER_ROUTE = '/plugins/dsh-plugins-mp/order'
 export const BACKUP_ROUTE = '/plugins/dsh-plugins-mp/backup'
+export const SYNC_ROUTE = '/plugins/dsh-plugins-mp/sync'
 export const SNAPSHOTS_ROUTE = '/plugins/dsh-plugins-mp/snapshots'
 export const RESTORE_SNAPSHOT_ROUTE = '/plugins/dsh-plugins-mp/restore-snapshot'
 export const STATUS_ROUTE = '/plugins/dsh-plugins-mp/status'
@@ -1412,6 +1423,138 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // Remote sync targets (plan #12): WebDAV + private Gist. Credentials
+      // arrive per request and are never persisted; the daily auto-backup
+      // runs against a Gist when the host env carries a GitHub token.
+      const stopSync = webServer.register({
+        kind: 'exact',
+        path: SYNC_ROUTE,
+        handler: async (req, res) => {
+          if (req.method === 'GET') {
+            json(res, 200, { sync: runtime?.getState().sync ?? { gistId: null, lastAt: null } })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          if (runtime === undefined) {
+            json(res, 503, { error: 'runtime is not available' })
+            return
+          }
+          let body: {
+            target?: unknown; action?: unknown; url?: unknown; username?: unknown; password?: unknown
+            token?: unknown; gistId?: unknown
+          } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          try {
+            const profileDir = resolveProfileDir(config)
+            if (body.target === 'webdav') {
+              const url = typeof body.url === 'string' ? body.url.trim() : ''
+              const username = typeof body.username === 'string' ? body.username : ''
+              const password = typeof body.password === 'string' ? body.password : ''
+              if (body.action === 'backup') {
+                await uploadWebdav(url, username, password, createProfileBackup(profileDir, profileName(config)))
+                logEvent('info', 'sync', 'webdav backup uploaded')
+                json(res, 200, { ok: true })
+              } else if (body.action === 'restore') {
+                // Preview flow: the client reviews, then POSTs the backup to /backup.
+                const backup = await downloadWebdav(url, username, password)
+                json(res, 200, { ok: true, backup })
+              } else {
+                json(res, 400, { error: 'invalid WebDAV action' })
+              }
+              return
+            }
+            if (body.target === 'gist') {
+              const now = new Date().toISOString()
+              if (body.action === 'export') {
+                const { token } = resolveGistToken(body.token)
+                if (token === '') {
+                  json(res, 400, { error: 'no GitHub token (paste one or set DSH_MP_GITHUB_TOKEN)', code: 'no-token' })
+                  return
+                }
+                const backup = createProfileBackup(profileDir, profileName(config))
+                const stateGistId = runtime.getState().sync.gistId
+                const inputId = typeof body.gistId === 'string' && body.gistId.trim() !== '' ? body.gistId.trim() : stateGistId
+                const ref = inputId !== null
+                  ? await updateGist(token, parseGistId(inputId), backup)
+                  : await createGist(token, backup)
+                runtime.updateState({ sync: { gistId: ref.id, lastAt: now } })
+                logEvent('info', 'sync', `gist backup ${ref.id}`)
+                json(res, 200, { ok: true, gistId: ref.id, gistUrl: ref.url })
+                return
+              }
+              if (body.action === 'import') {
+                const { token } = resolveGistToken(body.token)
+                if (token === '') {
+                  json(res, 400, { error: 'no GitHub token', code: 'no-token' })
+                  return
+                }
+                const gistId = typeof body.gistId === 'string' ? body.gistId.trim() : ''
+                if (gistId === '') {
+                  json(res, 400, { error: 'gist id is required' })
+                  return
+                }
+                // Preview flow: strictly validated, then the client POSTs it to /backup.
+                const backup = await readGist(token, parseGistId(gistId))
+                json(res, 200, { ok: true, backup })
+                return
+              }
+              if (body.action === 'verify') {
+                const { token, source } = resolveGistToken(body.token)
+                if (token === '') {
+                  json(res, 200, { ok: false, source: 'none' })
+                  return
+                }
+                await verifyGistToken(token)
+                json(res, 200, { ok: true, source })
+                return
+              }
+              if (body.action === 'auto') {
+                // Daily auto-backup: only with a host-side token (env/gh) —
+                // nothing secret is ever stored by the plugin itself.
+                const { token, source } = resolveGistToken(undefined)
+                if (token === '') {
+                  json(res, 200, { ok: false, source: 'none' })
+                  return
+                }
+                const last = runtime.getState().sync.lastAt
+                if (last !== null && Date.now() - Date.parse(last) < 24 * 3600_000) {
+                  json(res, 200, { ok: true, skipped: true, source, lastAt: last })
+                  return
+                }
+                const backup = createProfileBackup(profileDir, profileName(config))
+                const stateGistId = runtime.getState().sync.gistId
+                const ref = stateGistId !== null
+                  ? await updateGist(token, stateGistId, backup)
+                  : await createGist(token, backup)
+                runtime.updateState({ sync: { gistId: ref.id, lastAt: now } })
+                logEvent('info', 'sync', `auto gist backup ${ref.id} (token: ${source})`)
+                json(res, 200, { ok: true, source, gistId: ref.id, lastAt: now })
+                return
+              }
+              json(res, 400, { error: 'invalid Gist action' })
+              return
+            }
+            json(res, 400, { error: 'target must be webdav or gist' })
+          } catch (error) {
+            const cause = (error as { cause?: { code?: string; message?: string } }).cause
+            const detail = cause?.code !== undefined || cause?.message !== undefined ? ` (${cause?.code ?? ''} ${cause?.message ?? ''})` : ''
+            json(res, 400, { error: String(error instanceof Error ? error.message : error) + detail })
+          }
+        },
+      })
+
       const stopSnapshots = webServer.register({
         kind: 'exact',
         path: SNAPSHOTS_ROUTE,
@@ -1539,6 +1682,7 @@ export function mountRoutes(ctx: {
         stopGroup()
         stopOrder()
         stopBackup()
+        stopSync()
         stopSnapshots()
         stopRestoreSnapshot()
         stopStatus()

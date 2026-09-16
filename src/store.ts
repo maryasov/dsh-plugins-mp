@@ -18,6 +18,14 @@ export interface MpGroup {
   members: string[]
 }
 
+/** Remote backup bookkeeping (plan #12) — never any credential material. */
+export interface MpSync {
+  /** The private gist the auto-backup maintains (id allowlisted). */
+  gistId: string | null
+  /** ISO timestamp of the last successful gist sync. */
+  lastAt: string | null
+}
+
 export interface MpState {
   schemaVersion: typeof SCHEMA_VERSION
   /** Anonymous install-telemetry identity: a random UUID, nothing hardware-derived. */
@@ -32,6 +40,8 @@ export interface MpState {
   theme: { slug: string; name: string } | null
   /** Named plugin groups (plan #15): toggle all members as a unit. */
   groups: MpGroup[]
+  /** Remote backup state (plan #12): the auto-backup gist + last sync time. */
+  sync: MpSync
 }
 
 const MAX_NOTES = 200
@@ -87,6 +97,15 @@ function sanitizeGroups(value: unknown): MpGroup[] {
 // this module (an import back would be circular).
 const PACKAGE_NAME_RE = /^(?:@[a-z0-9-]+\/)?[a-z0-9][a-z0-9._-]{0,119}$/
 
+function sanitizeSync(value: unknown): MpSync {
+  const rec = value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  const gistId = typeof rec.gistId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(rec.gistId) ? rec.gistId : null
+  const lastAt = typeof rec.lastAt === 'string' && !Number.isNaN(Date.parse(rec.lastAt)) ? rec.lastAt : null
+  return { gistId, lastAt }
+}
+
 function defaults(): MpState {
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -96,6 +115,7 @@ function defaults(): MpState {
     notes: {},
     theme: null,
     groups: [],
+    sync: { gistId: null, lastAt: null },
   }
 }
 
@@ -125,6 +145,7 @@ export function loadMpState(dir: string): MpState {
       notes: sanitizeNotes(parsed.notes),
       theme: sanitizeTheme(parsed.theme),
       groups: sanitizeGroups(parsed.groups),
+      sync: sanitizeSync(parsed.sync),
     }
   } catch {
     return fallback

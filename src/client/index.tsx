@@ -358,6 +358,18 @@ const UI = {
     backupMissing: 'not in this profile',
     backupInvalid: 'Not a valid backup file.',
     backupSummary: 'Backup from {date}: {files} files, {deps} plugins.',
+    syncTitle: 'Sync',
+    syncHint: 'Remote backup of the settings. Passwords and tokens are never saved — enter them per action (a token from the host environment also works).',
+    syncWebdav: 'WebDAV (https)',
+    syncUpload: 'Upload',
+    syncDownloadCloud: 'Download',
+    syncGist: 'GitHub Gist (private)',
+    syncGistToken: 'token (optional)',
+    syncToGist: 'To Gist',
+    syncFromGist: 'From Gist',
+    syncAutoLine: 'Auto: {msg}',
+    syncDone: 'Done.',
+    syncRestoredFiles: 'restored {n} files',
     favAdd: 'Add to favorites',
     favRemove: 'Remove from favorites',
     favEmpty: 'Nothing here yet — tap ♥ on a card.',
@@ -471,6 +483,18 @@ const UI = {
     backupMissing: '本配置缺少',
     backupInvalid: '不是有效的备份文件。',
     backupSummary: '备份日期 {date}：{files} 个文件，{deps} 个插件。',
+    syncTitle: '同步',
+    syncHint: '设置的远程备份。密码和令牌不会被保存 — 每次操作时输入（也可使用主机环境中的令牌）。',
+    syncWebdav: 'WebDAV (https)',
+    syncUpload: '上传',
+    syncDownloadCloud: '下载',
+    syncGist: 'GitHub Gist（私有）',
+    syncGistToken: '令牌（可选）',
+    syncToGist: '上传到 Gist',
+    syncFromGist: '从 Gist 恢复',
+    syncAutoLine: '自动：{msg}',
+    syncDone: '完成。',
+    syncRestoredFiles: '已恢复 {n} 个文件',
     favAdd: '加入收藏',
     favRemove: '取消收藏',
     favEmpty: '还没有收藏 — 点击卡片上的 ♥。',
@@ -584,6 +608,18 @@ const UI = {
     backupMissing: 'нет в этом профиле',
     backupInvalid: 'Это не файл резервной копии.',
     backupSummary: 'Бэкап от {date}: {files} файлов, {deps} плагинов.',
+    syncTitle: 'Синхронизация',
+    syncHint: 'Удалённый бэкап настроек. Пароли и токены не сохраняются — вводите их при каждом действии (подойдёт и токен из окружения хоста).',
+    syncWebdav: 'WebDAV (https)',
+    syncUpload: 'Загрузить',
+    syncDownloadCloud: 'Скачать',
+    syncGist: 'GitHub Gist (приватный)',
+    syncGistToken: 'токен (необязательно)',
+    syncToGist: 'В Gist',
+    syncFromGist: 'Из Gist',
+    syncAutoLine: 'Авто: {msg}',
+    syncDone: 'Готово.',
+    syncRestoredFiles: 'восстановлено файлов: {n}',
     favAdd: 'В избранное',
     favRemove: 'Убрать из избранного',
     favEmpty: 'Пока пусто — нажмите ♥ на карточке.',
@@ -2076,6 +2112,176 @@ function BackupSection(props: { onNeedsRestart?: () => void }) {
   )
 }
 
+const SYNC_ROUTE = '/plugins/dsh-plugins-mp/sync'
+
+interface SyncResult {
+  ok?: boolean
+  error?: string
+  code?: string
+  backup?: unknown
+  gistId?: string | null
+  gistUrl?: string
+  source?: string
+  skipped?: boolean
+  lastAt?: string | null
+  files?: number
+  restartNeeded?: boolean
+}
+
+async function syncAction(body: Record<string, unknown>): Promise<SyncResult> {
+  return await pluginAction(SYNC_ROUTE, body) as SyncResult
+}
+
+/** Restore-through: fetch a remote backup, then feed it into the merge restore. */
+async function restoreRemote(backup: unknown): Promise<SyncResult> {
+  return await pluginAction(BACKUP_ROUTE, backup as Record<string, unknown>) as SyncResult
+}
+
+/** WebDAV + Gist backup targets (plan #12); credentials are never persisted. */
+function SyncSection(props: { onNeedsRestart?: () => void }) {
+  const t = UI[useUiLang()] as UiDict
+  const [davUrl, setDavUrl] = useState('')
+  const [davUser, setDavUser] = useState('')
+  const [davPass, setDavPass] = useState('')
+  const [gistToken, setGistToken] = useState('')
+  const [gistId, setGistId] = useState('')
+  const [status, setStatus] = useState<{ text: string; bad: boolean } | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    fetch(SYNC_ROUTE, { headers: { accept: 'application/json' } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { sync?: { gistId?: string | null; lastAt?: string | null } } | null) => {
+        if (alive && d?.sync?.gistId != null) setGistId(d.sync.gistId)
+      })
+      .catch(() => {})
+    // Daily auto-backup: server-side 24h gate, gist only (env/gh token).
+    void syncAction({ target: 'gist', action: 'auto' }).then((res) => {
+      if (!alive) return
+      if (res.ok === true && res.skipped === true) setStatus({ text: `gist ${res.lastAt?.slice(0, 10) ?? ''}`, bad: false })
+      else if (res.ok === true && res.gistId != null) setStatus({ text: `gist ${res.gistId} ✓`, bad: false })
+      else if (res.source === 'none') setStatus({ text: 'no host token', bad: true })
+    })
+    return () => { alive = false }
+  }, [])
+
+  const run = (body: Record<string, unknown>, after: (res: SyncResult) => void): void => {
+    if (busy) return
+    setBusy(true)
+    setStatus(null)
+    syncAction(body)
+      .then(after)
+      .catch((e) => setStatus({ text: String(e), bad: true }))
+      .finally(() => setBusy(false))
+  }
+
+  const restoreBackup = (backup: unknown): void => {
+    setBusy(true)
+    restoreRemote(backup)
+      .then((res) => {
+        if (res.error !== undefined) setStatus({ text: res.error, bad: true })
+        else {
+          setStatus({ text: t.syncRestoredFiles.replace('{n}', String(res.files ?? 0)), bad: false })
+          props.onNeedsRestart?.()
+        }
+      })
+      .catch((e) => setStatus({ text: String(e), bad: true }))
+      .finally(() => setBusy(false))
+  }
+
+  const input = (value: string, setValue: (v: string) => void, placeholder: string, type = 'text'): ReactNode => (
+    <input
+      style={{ ...S.search, flex: 1, minWidth: 120 }}
+      value={value}
+      type={type}
+      placeholder={placeholder}
+      onChange={(e) => setValue(e.target.value)}
+    />
+  )
+
+  return (
+    <div style={{ ...S.settingsRow, flexDirection: 'column', gap: 8 }}>
+      <div style={S.settingsText}>
+        <div style={S.settingsName}>{t.syncTitle}</div>
+        <div style={S.hint}>{t.syncHint}</div>
+      </div>
+
+      <div style={{ ...S.settingsText, gap: 2 }}>
+        <div style={{ fontWeight: 600, fontSize: 12 }}>{t.syncWebdav}</div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {input(davUrl, setDavUrl, 'https://dav.example.com/dsh/backup.json')}
+          {input(davUser, setDavUser, 'login')}
+          {input(davPass, setDavPass, '••••••', 'password')}
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button
+            type="button"
+            style={{ ...S.installBtn, marginLeft: 0 }}
+            disabled={busy || davUrl.trim() === ''}
+            onClick={() => run({ target: 'webdav', action: 'backup', url: davUrl.trim(), username: davUser, password: davPass },
+              (res) => setStatus(res.error !== undefined ? { text: res.error, bad: true } : { text: t.syncDone, bad: false }))}
+          >
+            {t.syncUpload}
+          </button>
+          <button
+            type="button"
+            style={S.installBtn}
+            disabled={busy || davUrl.trim() === ''}
+            onClick={() => run({ target: 'webdav', action: 'restore', url: davUrl.trim(), username: davUser, password: davPass },
+              (res) => {
+                if (res.error !== undefined || res.backup === undefined) setStatus({ text: res.error ?? 'no backup', bad: true })
+                else restoreBackup(res.backup)
+              })}
+          >
+            {t.syncDownloadCloud}
+          </button>
+        </div>
+      </div>
+
+      <div style={{ ...S.settingsText, gap: 2 }}>
+        <div style={{ fontWeight: 600, fontSize: 12 }}>{t.syncGist}</div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {input(gistToken, setGistToken, t.syncGistToken, 'password')}
+          {input(gistId, setGistId, 'Gist ID')}
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <button
+            type="button"
+            style={{ ...S.installBtn, marginLeft: 0 }}
+            disabled={busy}
+            onClick={() => run({ target: 'gist', action: 'export', token: gistToken.trim(), gistId: gistId.trim() },
+              (res) => {
+                if (res.error !== undefined) setStatus({ text: res.error, bad: true })
+                else {
+                  if (res.gistId != null) setGistId(res.gistId)
+                  setStatus({ text: `${res.gistUrl ?? t.syncDone}`, bad: false })
+                }
+              })}
+          >
+            {t.syncToGist}
+          </button>
+          <button
+            type="button"
+            style={S.installBtn}
+            disabled={busy || gistId.trim() === ''}
+            onClick={() => run({ target: 'gist', action: 'import', token: gistToken.trim(), gistId: gistId.trim() },
+              (res) => {
+                if (res.error !== undefined || res.backup === undefined) setStatus({ text: res.error ?? 'no backup', bad: true })
+                else restoreBackup(res.backup)
+              })}
+          >
+            {t.syncFromGist}
+          </button>
+          {status !== null ? (
+            <span style={{ ...S.hint, color: status.bad ? '#e5484d' : '#46a758' }}>{status.text}</span>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function SettingsView(props: { children?: ReactNode; onNeedsRestart?: () => void } = {}) {
   const uiLangCode = useUiLang()
   const t = UI[uiLangCode] as UiDict
@@ -2136,6 +2342,7 @@ function SettingsView(props: { children?: ReactNode; onNeedsRestart?: () => void
       </div>
       {props.children}
       <BackupSection onNeedsRestart={props.onNeedsRestart} />
+      <SyncSection onNeedsRestart={props.onNeedsRestart} />
       <div style={{ ...S.settingsRow, opacity: 0.55 }}>
         <div style={S.settingsText}>
           <div style={S.settingsName}>{t.installStats}</div>
