@@ -161,13 +161,30 @@ interface InstalledItem {
   hasClient: boolean
   updateAvailable?: boolean
   latest?: string | null
+  disabled?: boolean
+  live?: boolean
 }
 
 async function fetchInstalled(): Promise<InstalledItem[]> {
   const res = await fetch('/plugins/dsh-plugins-mp/installed', { headers: { accept: 'application/json' } })
   if (!res.ok) throw new Error(String(res.status))
   const body = (await res.json()) as { items?: InstalledItem[] }
-  return body.items ?? []
+  const items = body.items ?? []
+  try {
+    const tRes = await fetch('/plugins/dsh-plugins-mp/toggle', { headers: { accept: 'application/json' } })
+    if (tRes.ok) {
+      const state = (await tRes.json()) as { items?: Array<{ name: string; disabled: boolean; live: boolean }> }
+      const byName = new Map((state.items ?? []).map((row) => [row.name, row]))
+      for (const item of items) {
+        const row = byName.get(item.name)
+        if (row !== undefined) {
+          item.disabled = row.disabled
+          item.live = row.live
+        }
+      }
+    }
+  } catch { /* toggle state stays unknown */ }
+  return items
 }
 
 async function fetchUpdates(): Promise<Record<string, { latest: string | null; updateAvailable: boolean }>> {
@@ -181,7 +198,7 @@ async function fetchUpdates(): Promise<Record<string, { latest: string | null; u
   }
 }
 
-async function pluginAction(route: string, body: Record<string, unknown>): Promise<{ ok?: boolean; output?: string; error?: string }> {
+async function pluginAction(route: string, body: Record<string, unknown>): Promise<{ ok?: boolean; output?: string; error?: string; restartNeeded?: boolean }> {
   const res = await fetch(route, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -265,6 +282,18 @@ const UI = {
     fullscreen: 'Full screen',
     exitFullscreen: 'Exit full screen',
     myPlugins: 'Installed in this profile',
+    liveBadge: 'live',
+    offBadge: 'off',
+    toggleOff: 'Turn off',
+    toggleOn: 'Turn on',
+    restartPending: 'A restart is needed to apply all changes.',
+    restartNow: 'Restart',
+    restartingLabel: 'Restarting…',
+    dupRows: 'Duplicate loader rows',
+    missingRows: 'Listed but not on disk',
+    linkRows: 'Local (link/file) plugins',
+    disabledRowsLabel: 'Disabled rows',
+    liveRows: 'Hot-mounted now',
   },
   zh: {
     title: '插件市场',
@@ -325,6 +354,18 @@ const UI = {
     fullscreen: '全屏',
     exitFullscreen: '退出全屏',
     myPlugins: '已安装到此配置',
+    liveBadge: '运行中',
+    offBadge: '已关闭',
+    toggleOff: '关闭',
+    toggleOn: '开启',
+    restartPending: '需要重启才能应用所有更改。',
+    restartNow: '重启',
+    restartingLabel: '重启中…',
+    dupRows: '重复的 loader 行',
+    missingRows: '清单中列出但磁盘上不存在',
+    linkRows: '本地 (link/file) 插件',
+    disabledRowsLabel: '已禁用的行',
+    liveRows: '热挂载中',
   },
   ru: {
     title: 'Маркетплейс',
@@ -385,6 +426,18 @@ const UI = {
     fullscreen: 'Во весь экран',
     exitFullscreen: 'Выйти из полного экрана',
     myPlugins: 'Установлено в этом профиле',
+    liveBadge: 'живой',
+    offBadge: 'выкл',
+    toggleOff: 'Выключить',
+    toggleOn: 'Включить',
+    restartPending: 'Для применения всех изменений нужен перезапуск.',
+    restartNow: 'Перезапустить',
+    restartingLabel: 'Перезапускаю…',
+    dupRows: 'Дубли loader-строк',
+    missingRows: 'В манифесте, но не на диске',
+    linkRows: 'Локальные (link/file) плагины',
+    disabledRowsLabel: 'Отключённые строки',
+    liveRows: 'Hot-смонтированы сейчас',
   },
 } as const
 
@@ -1513,6 +1566,7 @@ function SettingsView(props: { children?: ReactNode } = {}) {
 function InstalledRow(props: {
   item: InstalledItem
   onChange: () => void
+  onNeedsRestart?: () => void
 }) {
   const t = uiLang()
   const { item } = props
@@ -1528,6 +1582,7 @@ function InstalledRow(props: {
       .then((res) => {
         if (res.error !== undefined) setError(res.error)
         else props.onChange()
+        if (res.restartNeeded === true) props.onNeedsRestart?.()
       })
       .catch((e) => setError(String(e)))
       .finally(() => { setBusy(false); setConfirming(false) })
@@ -1543,6 +1598,15 @@ function InstalledRow(props: {
           <span style={{ ...S.badge, ...BADGE_TONE.unknown }}>→ {item.latest}</span>
         ) : null}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button
+            type="button"
+            style={{ ...S.installBtn, ...(item.disabled === true ? {} : BADGE_TONE.passed) }}
+            disabled={busy}
+            title={item.disabled === true ? t.toggleOn : t.toggleOff}
+            onClick={() => act('/plugins/dsh-plugins-mp/toggle', { name: item.name, disable: item.disabled !== true })}
+          >
+            {busy ? '…' : item.disabled === true ? t.offBadge : t.liveBadge}
+          </button>
           {item.source === 'npm' && item.updateAvailable === true ? (
             <button
               type="button"
@@ -1581,7 +1645,7 @@ function InstalledRow(props: {
 }
 
 /** The "My plugins" tab: live inventory of the running profile. */
-function InstalledView() {
+function InstalledView(props: { onNeedsRestart?: () => void } = {}) {
   const t = uiLang()
   const [items, setItems] = useState<InstalledItem[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -1613,7 +1677,7 @@ function InstalledView() {
       />
       {filtered.length === 0 ? <div style={S.placeholder}>{t.mineEmpty}</div> : null}
       {filtered.map((item) => (
-        <InstalledRow key={item.name} item={item} onChange={reload} />
+        <InstalledRow key={item.name} item={item} onChange={reload} onNeedsRestart={props.onNeedsRestart} />
       ))}
     </div>
   )
@@ -1654,8 +1718,113 @@ function PnpmHealthRow() {
   )
 }
 
-const COMING_TABS = ['favorites', 'themes', 'diagnostics'] as const
-type ShellTab = 'catalog' | 'mine' | (typeof COMING_TABS)[number] | 'settings'
+interface DiagnosticsReport {
+  dsh: { version: string } | null
+  pluginCount: number
+  duplicates: Array<{ id: string; count: number }>
+  missingOnDisk: string[]
+  linkSources: string[]
+  disabledRows: string[]
+  hot: string[]
+}
+
+/** The Diagnostics tab: one read-only page of composition health. */
+function DiagnosticsView() {
+  const uiLangCode = useUiLang()
+  const t = UI[uiLangCode] as UiDict
+  const [report, setReport] = useState<DiagnosticsReport | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    fetch('/plugins/dsh-plugins-mp/diagnostics', { headers: { accept: 'application/json' } })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
+      .then((body: DiagnosticsReport) => setReport(body))
+      .catch((e) => setError(String(e)))
+  }, [])
+  if (error !== null) return <div style={S.placeholder}>{error}</div>
+  if (report === null) return <div style={S.placeholder}>{t.loading}</div>
+  const section = (title: string, rows: string[]): ReactNode => (
+    <div style={S.settingsRow}>
+      <div style={S.settingsText}>
+        <div style={S.settingsName}>{title}</div>
+        {rows.length === 0
+          ? <div style={S.hint}>—</div>
+          : rows.map((row) => <div key={row} style={S.hint}>{row}</div>)}
+      </div>
+    </div>
+  )
+  const problems: string[] = [
+    ...report.duplicates.map((d) => `- ${t.dupRows}: ${d.id} ×${d.count}`),
+    ...report.missingOnDisk.map((name) => `- ${t.missingRows}: ${name}`),
+  ]
+  const copyFixPrompt = (): void => {
+    const lines = [
+      uiLangCode === 'ru' ? 'Исправь конфигурацию профиля DSH. Проблемы:' : 'Fix the DSH profile composition. Problems:',
+      ...problems,
+      uiLangCode === 'ru'
+        ? 'Предложи минимальные правки cordis.patch.yml / package.json профиля. Не трогай работающие процессы.'
+        : 'Propose minimal edits to the profile cordis.patch.yml / package.json. Do not touch running processes.',
+    ]
+    void navigator.clipboard?.writeText(lines.join('\n')).catch(() => {})
+  }
+  return (
+    <div style={S.settings}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={{ ...S.hint, flex: 1 }}>
+          DSH {report.dsh?.version ?? '?'} · {t.myPlugins} ({report.pluginCount})
+        </div>
+        {problems.length > 0 ? (
+          <button type="button" style={S.installBtn} onClick={copyFixPrompt}>
+            {uiLangCode === 'ru' ? 'Скопировать AI-fix' : uiLangCode === 'zh' ? '复制 AI 修复提示' : 'Copy AI-fix prompt'}
+          </button>
+        ) : null}
+      </div>
+      {section(t.dupRows, report.duplicates.map((d) => `${d.id} ×${d.count}`))}
+      {section(t.missingRows, report.missingOnDisk)}
+      {section(t.linkRows, report.linkSources)}
+      {section(t.disabledRowsLabel, report.disabledRows)}
+      {section(t.liveRows, report.hot)}
+    </div>
+  )
+}
+
+/**
+ * Banner + poll-until-changed restart flow: the host restarts OUTSIDE this
+ * process (systemd or the successor script), the UI polls /status until the
+ * pid changes, then reloads.
+ */
+function useRestartFlow(): { pending: boolean; restarting: boolean; arm: () => void } {
+  const [pending, setPending] = useState(false)
+  const [restarting, setRestarting] = useState(false)
+  const arm = (): void => setPending(true)
+  useEffect(() => {
+    if (!pending || restarting) return
+    let alive = true
+    void (async () => {
+      setRestarting(true)
+      try {
+        const before = await fetch('/plugins/dsh-plugins-mp/status', { headers: { accept: 'application/json' } })
+          .then((res) => res.json()) as { pid?: number }
+        await fetch('/plugins/dsh-plugins-mp/restart', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+        for (let i = 0; i < 120; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+          try {
+            const after = await fetch('/plugins/dsh-plugins-mp/status', { headers: { accept: 'application/json' } })
+              .then((res) => res.json()) as { pid?: number }
+            if (after.pid !== undefined && before.pid !== undefined && after.pid !== before.pid) break
+          } catch { /* host going down — keep polling */ }
+        }
+        window.location.reload()
+      } catch {
+        if (alive) setRestarting(false)
+      }
+    })()
+    return () => { alive = false }
+  }, [pending, restarting])
+  return { pending, restarting, arm }
+}
+
+const COMING_TABS = ['favorites', 'themes'] as const
+type ShellTab = 'catalog' | 'mine' | 'diagnostics' | (typeof COMING_TABS)[number] | 'settings'
 
 /**
  * The market shell: one tabbed surface shared by the better-sidebar tab and
@@ -1672,6 +1841,7 @@ function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
   const [tab, setTab] = useState<ShellTab>('catalog')
   const [fullscreen, setFullscreen] = useState(false)
   const surface = props.surface ?? 'sidebar'
+  const { pending: restartPending, restarting, arm: armRestart } = useRestartFlow()
 
   useEffect(() => {
     if (!fullscreen) return
@@ -1693,6 +1863,11 @@ function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
 
   const body = (
     <div style={{ ...S.root, ...(fullscreen ? { height: '100vh' } : {}) }} data-fullscreen={fullscreen || undefined}>
+      {restartPending ? (
+        <div style={{ ...S.settingsRow, flexShrink: 0, alignItems: 'center', gap: 8 }}>
+          <div style={{ ...S.hint, flex: 1 }}>{restarting ? t.restartingLabel : t.restartPending}</div>
+        </div>
+      ) : null}
       <div style={S.tabbar}>
         {tabs.map((entry) => (
           <button
@@ -1716,12 +1891,13 @@ function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
         ) : null}
       </div>
       {tab === 'catalog' ? <CatalogView {...props} /> : null}
-      {tab === 'mine' ? <InstalledView /> : null}
+      {tab === 'mine' ? <InstalledView onNeedsRestart={armRestart} /> : null}
       {tab === 'settings' ? (
         <SettingsView>
           <PnpmHealthRow />
         </SettingsView>
       ) : null}
+      {tab === 'diagnostics' ? <DiagnosticsView /> : null}
       {COMING_TABS.includes(tab as (typeof COMING_TABS)[number]) ? (
         <div style={S.placeholder}>{t.comingSoon}</div>
       ) : null}

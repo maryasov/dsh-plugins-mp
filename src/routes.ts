@@ -16,7 +16,7 @@
  *   model-facing tools live through the runtime.
  * - GET  /plugins/dsh-plugins-mp/logs → sanitized plain-text event log.
  */
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -32,7 +32,11 @@ import {
 } from './installed.js'
 import { exportLog, logEvent } from './log.js'
 import { resolveProfileDir } from './mp-home.js'
+import { cleanHotDir, hotMount, hotUnmount, listHotMounts, readUserPatchControls, patchLayerManages, rowIdFor } from './hot.js'
 import type { MpRuntime } from './runtime.js'
+import { snapshotCreate, snapshotDelete, snapshotList, snapshotRestore } from './snapshot.js'
+import { isDisabledByPatch, setPatchDisabled } from './toggle.js'
+import { statusFingerprint, successorPending, triggerRestart } from './restart.js'
 import { allowBuildsAdd } from './workspace-yaml.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
@@ -45,6 +49,12 @@ export const UPDATE_ROUTE = '/plugins/dsh-plugins-mp/update'
 export const APPROVE_BUILDS_ROUTE = '/plugins/dsh-plugins-mp/approve-builds'
 export const HEALTH_ROUTE = '/plugins/dsh-plugins-mp/health'
 export const SETUP_PNPM_ROUTE = '/plugins/dsh-plugins-mp/setup-pnpm'
+export const TOGGLE_ROUTE = '/plugins/dsh-plugins-mp/toggle'
+export const SNAPSHOTS_ROUTE = '/plugins/dsh-plugins-mp/snapshots'
+export const RESTORE_SNAPSHOT_ROUTE = '/plugins/dsh-plugins-mp/restore-snapshot'
+export const STATUS_ROUTE = '/plugins/dsh-plugins-mp/status'
+export const RESTART_ROUTE = '/plugins/dsh-plugins-mp/restart'
+export const DIAGNOSTICS_ROUTE = '/plugins/dsh-plugins-mp/diagnostics'
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000
 const MAX_OUTPUT_CHARS = 20_000
@@ -122,6 +132,10 @@ export interface InstallOutcome {
   verified?: boolean | null
   /** The dependency name the install added, when it could be determined. */
   installedName?: string | null
+  /** Live-mounted into the running composition (no restart needed). */
+  hot?: boolean
+  /** Why hot-mount did not happen (restart needed). */
+  hotReason?: string
 }
 
 /**
@@ -338,6 +352,8 @@ export function mountRoutes(ctx: {
   inject: (deps: string[], fn: (sctx: never) => unknown) => unknown
   /** Cordis context read (agents inventory) when the host exposes it. */
   get?: (name: string) => unknown
+  /** Cordis child-fiber mount — the hot-mount subtree anchor. */
+  plugin?: (plugin: unknown, config: unknown) => { await(): Promise<unknown>; dispose(): Promise<unknown> | void }
 }, config: MpApiConfig & { profile?: string } = {}, runtime?: MpRuntime): void {
   const apiBase = resolveApiBase(config)
   let installing = false
@@ -356,6 +372,9 @@ export function mountRoutes(ctx: {
     sctx.effect(() => {
       const webServer = sctx.webServer
       if (webServer === undefined) return () => {}
+      // Leftover hot-mount inputs from a crashed session must never collide
+      // with the bundle layer; state.json survives the wipe.
+      try { cleanHotDir(resolveProfileDir(config)) } catch { /* profile may not exist yet */ }
       const json = (res: NodeRes, status: number, body: unknown): void => {
         res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
         res.end(JSON.stringify(body))
@@ -430,6 +449,7 @@ export function mountRoutes(ctx: {
           try {
             const profileDir = resolveProfileDir({ profile })
             const before = new Set(readInstalled(profileDir).map((item) => item.name))
+            snapshotCreate(profileDir, `before install ${resolved.source}`)
             const outcome = await runDshPluginAdd(profile, resolved.source)
             if (outcome.ok) {
               // Verified install = a (new) dependency whose manifest is on
@@ -440,6 +460,13 @@ export function mountRoutes(ctx: {
               const installedName = added[0] ?? (isPlainSpec ? resolved.source.replace(/@[^\s/@]+$/, '') : null)
               outcome.installedName = installedName
               outcome.verified = installedName === null ? null : isPackageOnDisk(profileDir, installedName)
+              // Live activation: mount the freshly installed package into the
+              // running composition; a non-plain patch falls back to restart.
+              if (installedName !== null && ctx.plugin !== undefined) {
+                const hot = await hotMount(ctx as Parameters<typeof hotMount>[0], profileDir, installedName)
+                outcome.hot = hot.ok
+                if (!hot.ok) outcome.hotReason = hot.reason ?? undefined
+              }
             }
             logEvent(outcome.ok ? 'info' : 'warn', 'install',
               `${resolved.source} → profile ${profile}: ${outcome.ok ? `ok${outcome.ignoredBuilds?.length ? `, blocked builds: ${outcome.ignoredBuilds.join(', ')}` : ''}` : `failed (code ${outcome.code}${outcome.timedOut ? ', timed out' : ''})`}`)
@@ -547,6 +574,9 @@ export function mountRoutes(ctx: {
           }
           installing = true
           try {
+            const profileDir = resolveProfileDir({ profile })
+            snapshotCreate(profileDir, `before uninstall ${name}`)
+            await hotUnmount(name)
             const outcome = await runDshPlugin(profile, ['remove', name])
             logEvent(outcome.ok ? 'info' : 'warn', 'uninstall',
               `${name} from profile ${profile}: ${outcome.ok ? 'removed' : `failed (code ${outcome.code})`}`)
@@ -613,6 +643,7 @@ export function mountRoutes(ctx: {
           }
           installing = true
           try {
+            snapshotCreate(resolveProfileDir({ profile }), `before update ${name}`)
             const outcome = await runDshPlugin(profile, ['add', `${name}@latest`])
             logEvent(outcome.ok ? 'info' : 'warn', 'update',
               `${name} in profile ${profile}: ${outcome.ok ? 'updated' : `failed (code ${outcome.code})`}`)
@@ -663,7 +694,7 @@ export function mountRoutes(ctx: {
       const stopHealth = webServer.register({
         kind: 'exact',
         path: HEALTH_ROUTE,
-        handler: (_req, res) => {
+        handler: (_req: NodeReq, res: NodeRes) => {
           let settled = false
           const done = (body: unknown): void => {
             if (settled) return
@@ -727,6 +758,197 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // ------------------------------------------------------------------
+      // Live composition: toggle, snapshots, restart, diagnostics.
+      // ------------------------------------------------------------------
+
+      const stopToggle = webServer.register({
+        kind: 'exact',
+        path: TOGGLE_ROUTE,
+        handler: async (req, res) => {
+          if (req.method === 'GET') {
+            const profileDir = resolveProfileDir(config)
+            const items = readInstalled(profileDir)
+            const hot = listHotMounts()
+            json(res, 200, {
+              hot,
+              items: items.map((item) => ({
+                name: item.name,
+                disabled: isDisabledByPatch(profileDir, item.name),
+                live: hot.includes(item.name),
+              })),
+            })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          let body: { name?: unknown; disable?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const name = typeof body.name === 'string' ? body.name : ''
+          const disable = body.disable === true
+          if (!PACKAGE_RE.test(name)) {
+            json(res, 400, { error: 'invalid package name' })
+            return
+          }
+          if (ctx.plugin === undefined) {
+            json(res, 503, { error: 'hot composition surface is unavailable in this host' })
+            return
+          }
+          const profileDir = resolveProfileDir(config)
+          const userControls = readUserPatchControls(profileDir)
+          const hotLive = listHotMounts().includes(name)
+          let live = hotLive
+          if (disable) {
+            if (hotLive) live = !(await hotUnmount(name))
+            const patch = setPatchDisabled(profileDir, name, true)
+            if (patch.conflict === true) {
+              json(res, 409, { error: `the patch layer already manages a row for ${name} — edit cordis.patch.yml by hand` })
+              return
+            }
+            live = false
+          } else {
+            const patch = setPatchDisabled(profileDir, name, false)
+            if (patch.conflict === true) {
+              json(res, 409, { error: `the patch layer already manages a row for ${name} — edit cordis.patch.yml by hand` })
+              return
+            }
+            if (!patchLayerManages(userControls, name)) {
+              // Not patch-managed: the watcher will not re-apply it — mount
+              // live unless it is already hot-live.
+              if (!hotLive) {
+                const mount = await hotMount(ctx as Parameters<typeof hotMount>[0], profileDir, name)
+                live = mount.ok
+                if (!mount.ok) {
+                  json(res, 200, { ok: true, live: false, restartNeeded: true, reason: mount.reason })
+                  return
+                }
+              }
+            }
+          }
+          logEvent('info', 'toggle', `${name}: ${disable ? 'off' : 'on'} (live=${String(live)})`)
+          json(res, 200, { ok: true, live, restartNeeded: false })
+        },
+      })
+
+      const stopSnapshots = webServer.register({
+        kind: 'exact',
+        path: SNAPSHOTS_ROUTE,
+        handler: (_req, res) => {
+          json(res, 200, { items: snapshotList(resolveProfileDir(config)) })
+        },
+      })
+
+      const stopRestoreSnapshot = webServer.register({
+        kind: 'exact',
+        path: RESTORE_SNAPSHOT_ROUTE,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          let body: { id?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const id = typeof body.id === 'string' ? body.id : ''
+          const result = snapshotRestore(resolveProfileDir(config), id)
+          if (!result.ok) {
+            json(res, 400, { error: result.error ?? 'restore failed' })
+            return
+          }
+          logEvent('info', 'snapshot', `restored ${id}; restart to apply`)
+          json(res, 200, { ok: true, restartNeeded: true })
+        },
+      })
+
+      const stopStatus = webServer.register({
+        kind: 'exact',
+        path: STATUS_ROUTE,
+        handler: (_req, res) => {
+          const fingerprint = statusFingerprint()
+          json(res, 200, { ...fingerprint, successor: successorPending(resolveProfileDir(config)), uptime: Math.round(process.uptime()) })
+        },
+      })
+
+      const stopRestart = webServer.register({
+        kind: 'exact',
+        path: RESTART_ROUTE,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          // Reply FIRST: under systemd the restart kills this process the
+          // moment systemctl runs — the response must already be on the wire.
+          json(res, 200, { ok: true })
+          try {
+            triggerRestart(resolveProfileDir(config))
+          } catch (error) {
+            logEvent('error', 'restart', String(error instanceof Error ? error.message : error))
+          }
+        },
+      })
+
+      const stopDiagnostics = webServer.register({
+        kind: 'exact',
+        path: DIAGNOSTICS_ROUTE,
+        handler: (_req, res) => {
+          const profileDir = resolveProfileDir(config)
+          const items = readInstalled(profileDir)
+          const patchIds = new Map<string, number>()
+          try {
+            const text = readFileSync(join(profileDir, 'cordis.patch.yml'), 'utf8')
+            for (const line of text.split(/\r?\n/)) {
+              const m = /^\s*-\s*id:\s*['"]?([A-Za-z0-9._/@-]+)/.exec(line)
+              if (m !== null) patchIds.set(m[1], (patchIds.get(m[1]) ?? 0) + 1)
+            }
+          } catch { /* no patch file */ }
+          const duplicates = [...patchIds.entries()].filter(([, count]) => count > 1).map(([id, count]) => ({ id, count }))
+          const missingOnDisk = items.filter((item) => item.version === null).map((item) => item.name)
+          const linkSources = items.filter((item) => item.source === 'link' || item.source === 'file').map((item) => item.name)
+          const userManaged = [...readUserPatchControls(profileDir).ids]
+          const disabledRows = userManaged.filter((id) => {
+            try {
+              const text = readFileSync(join(profileDir, 'cordis.patch.yml'), 'utf8')
+              return new RegExp(`-\\s*id:\\s*['"]?${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]?\\s*$[\\s\S]*?disabled:\s*true`).test(text)
+            } catch {
+              return false
+            }
+          })
+          json(res, 200, {
+            dsh: dshHostInfo(),
+            pluginCount: items.length,
+            duplicates,
+            missingOnDisk,
+            linkSources,
+            disabledRows,
+            hot: listHotMounts(),
+          })
+        },
+      })
+
       return () => {
         stopHost()
         stopConfig()
@@ -739,6 +961,12 @@ export function mountRoutes(ctx: {
         stopApproveBuilds()
         stopHealth()
         stopSetupPnpm()
+        stopToggle()
+        stopSnapshots()
+        stopRestoreSnapshot()
+        stopStatus()
+        stopRestart()
+        stopDiagnostics()
       }
     }, 'dsh-plugins-mp: host routes')
   })
