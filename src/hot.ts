@@ -293,7 +293,15 @@ export function readUserPatchControls(profileDir: string): { ids: Set<string>; n
   const names = new Set<string>()
   try {
     const text = readFileSync(join(profileDir, 'cordis.patch.yml'), 'utf8')
+    // Skip OUR managed disable blocks: a row we wrote must never count as
+    // "the user patch manages this id" — otherwise enable, which reads the
+    // file BEFORE its own block is removed, skips the live re-mount.
+    let inManagedBlock = false
     for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith('# >>> dsh-mp disable ')) { inManagedBlock = true; continue }
+      if (trimmed.startsWith('# <<< dsh-mp disable ')) { inManagedBlock = false; continue }
+      if (inManagedBlock) continue
       const id = /^\s*-?\s*id:\s*['"]?([A-Za-z0-9._/@-]+)/.exec(line)
       if (id !== null) ids.add(id[1])
       const name = /^\s*name:\s*['"]?([^'"\s]+)/.exec(line)

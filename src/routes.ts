@@ -38,6 +38,7 @@ import { snapshotCreate, snapshotDelete, snapshotList, snapshotRestore } from '.
 import { isDisabledByPatch, setPatchDisabled } from './toggle.js'
 import { statusFingerprint, successorPending, triggerRestart } from './restart.js'
 import { allowBuildsAdd } from './workspace-yaml.js'
+import { isValidGroupName, type MpGroup } from './store.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
@@ -53,6 +54,7 @@ export const APPROVE_BUILDS_ROUTE = '/plugins/dsh-plugins-mp/approve-builds'
 export const HEALTH_ROUTE = '/plugins/dsh-plugins-mp/health'
 export const SETUP_PNPM_ROUTE = '/plugins/dsh-plugins-mp/setup-pnpm'
 export const TOGGLE_ROUTE = '/plugins/dsh-plugins-mp/toggle'
+export const GROUP_ROUTE = '/plugins/dsh-plugins-mp/group'
 export const SNAPSHOTS_ROUTE = '/plugins/dsh-plugins-mp/snapshots'
 export const RESTORE_SNAPSHOT_ROUTE = '/plugins/dsh-plugins-mp/restore-snapshot'
 export const STATUS_ROUTE = '/plugins/dsh-plugins-mp/status'
@@ -349,6 +351,51 @@ function mutatingBlock(ctx: { get?: (name: string) => unknown }): { error: strin
     error: `an agent session is running (${agents.join(', ')}) — plugin changes are paused until it finishes`,
     agents,
   }
+}
+
+export type ToggleOneResult =
+  | { ok: true; live: boolean; restartNeeded?: boolean; reason?: string }
+  | { ok: false; conflict: boolean; error: string }
+
+/**
+ * Enable/disable ONE installed plugin — the shared core behind the single
+ * toggle route and group toggles (#15): a live hot mount goes down/up
+ * immediately, the managed patch row decides the next boot, and a row the
+ * user patch manages itself is reported as a conflict instead of fought over.
+ */
+async function toggleOne(
+  ctx: Parameters<typeof hotMount>[0],
+  profileDir: string,
+  name: string,
+  disable: boolean,
+): Promise<ToggleOneResult> {
+  const userControls = readUserPatchControls(profileDir)
+  const hotLive = listHotMounts().includes(name)
+  let live = hotLive
+  if (disable) {
+    if (hotLive) live = !(await hotUnmount(name))
+    const patch = setPatchDisabled(profileDir, name, true)
+    if (patch.conflict === true) {
+      return { ok: false, conflict: true, error: `the patch layer already manages a row for ${name} — edit cordis.patch.yml by hand` }
+    }
+    live = false
+  } else {
+    const patch = setPatchDisabled(profileDir, name, false)
+    if (patch.conflict === true) {
+      return { ok: false, conflict: true, error: `the patch layer already manages a row for ${name} — edit cordis.patch.yml by hand` }
+    }
+    if (!patchLayerManages(userControls, name)) {
+      // Not patch-managed: the watcher will not re-apply it — mount
+      // live unless it is already hot-live.
+      if (!hotLive) {
+        const mount = await hotMount(ctx, profileDir, name)
+        live = mount.ok
+        if (!mount.ok) return { ok: true, live: false, restartNeeded: true, reason: mount.reason }
+      }
+    }
+  }
+  logEvent('info', 'toggle', `${name}: ${disable ? 'off' : 'on'} (live=${String(live)})`)
+  return { ok: true, live, restartNeeded: false }
 }
 
 export function mountRoutes(ctx: {
@@ -974,39 +1021,109 @@ export function mountRoutes(ctx: {
             json(res, 503, { error: 'hot composition surface is unavailable in this host' })
             return
           }
-          const profileDir = resolveProfileDir(config)
-          const userControls = readUserPatchControls(profileDir)
-          const hotLive = listHotMounts().includes(name)
-          let live = hotLive
-          if (disable) {
-            if (hotLive) live = !(await hotUnmount(name))
-            const patch = setPatchDisabled(profileDir, name, true)
-            if (patch.conflict === true) {
-              json(res, 409, { error: `the patch layer already manages a row for ${name} — edit cordis.patch.yml by hand` })
-              return
-            }
-            live = false
-          } else {
-            const patch = setPatchDisabled(profileDir, name, false)
-            if (patch.conflict === true) {
-              json(res, 409, { error: `the patch layer already manages a row for ${name} — edit cordis.patch.yml by hand` })
-              return
-            }
-            if (!patchLayerManages(userControls, name)) {
-              // Not patch-managed: the watcher will not re-apply it — mount
-              // live unless it is already hot-live.
-              if (!hotLive) {
-                const mount = await hotMount(ctx as Parameters<typeof hotMount>[0], profileDir, name)
-                live = mount.ok
-                if (!mount.ok) {
-                  json(res, 200, { ok: true, live: false, restartNeeded: true, reason: mount.reason })
-                  return
-                }
-              }
-            }
+          const result = await toggleOne(ctx as Parameters<typeof hotMount>[0], resolveProfileDir(config), name, disable)
+          if (!result.ok) {
+            json(res, 409, { error: result.error })
+            return
           }
-          logEvent('info', 'toggle', `${name}: ${disable ? 'off' : 'on'} (live=${String(live)})`)
-          json(res, 200, { ok: true, live, restartNeeded: false })
+          json(res, 200, result)
+        },
+      })
+
+      // Groups (plan #15): named sets of installed packages toggled as one
+      // unit. GET → { groups }; POST { action, name, member?, disable? } with
+      // action ∈ create | delete | add | remove | toggle.
+      const stopGroup = webServer.register({
+        kind: 'exact',
+        path: GROUP_ROUTE,
+        handler: async (req, res) => {
+          if (req.method === 'GET') {
+            json(res, 200, { groups: runtime?.getState().groups ?? [] })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          if (runtime === undefined) {
+            json(res, 503, { error: 'runtime is not available' })
+            return
+          }
+          let body: { action?: unknown; name?: unknown; member?: unknown; disable?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const action = typeof body.action === 'string' ? body.action : ''
+          const name = typeof body.name === 'string' ? body.name.trim() : ''
+          if (!['create', 'delete', 'add', 'remove', 'toggle'].includes(action)) {
+            json(res, 400, { error: 'action must be one of create/delete/add/remove/toggle' })
+            return
+          }
+          if (!isValidGroupName(name)) {
+            json(res, 400, { error: 'invalid group name' })
+            return
+          }
+          const groups: MpGroup[] = runtime.getState().groups.map((g) => ({ ...g, members: [...g.members] }))
+          const group = groups.find((g) => g.name.toLowerCase() === name.toLowerCase())
+
+          if (action === 'create') {
+            if (group !== undefined) {
+              json(res, 409, { error: `group "${name}" already exists` })
+              return
+            }
+            groups.push({ name, members: [] })
+          } else if (group === undefined) {
+            json(res, 404, { error: `group "${name}" not found` })
+            return
+          } else if (action === 'delete') {
+            groups.splice(groups.indexOf(group), 1)
+          } else if (action === 'add' || action === 'remove') {
+            const member = typeof body.member === 'string' ? body.member : ''
+            if (!PACKAGE_RE.test(member)) {
+              json(res, 400, { error: 'invalid package name' })
+              return
+            }
+            if (action === 'add') {
+              if (!group.members.includes(member) && group.members.length >= 50) {
+                json(res, 409, { error: 'group is full (50 members max)' })
+                return
+              }
+              if (!group.members.includes(member)) group.members.push(member)
+            } else {
+              group.members = group.members.filter((m) => m !== member)
+            }
+          } else if (action === 'toggle') {
+            if (ctx.plugin === undefined) {
+              json(res, 503, { error: 'hot composition surface is unavailable in this host' })
+              return
+            }
+            const disable = body.disable === true
+            const installed = new Set(readInstalled(resolveProfileDir(config)).map((item) => item.name))
+            const results: Array<{ name: string; ok: boolean; live?: boolean; skipped?: boolean; error?: string; restartNeeded?: boolean }> = []
+            for (const member of group.members) {
+              if (!installed.has(member)) {
+                results.push({ name: member, ok: true, skipped: true })
+                continue
+              }
+              const r = await toggleOne(ctx as Parameters<typeof hotMount>[0], resolveProfileDir(config), member, disable)
+              results.push(r.ok ? { name: member, ok: true, live: r.live, restartNeeded: r.restartNeeded } : { name: member, ok: false, error: r.error })
+            }
+            const restartNeeded = results.some((r) => r.restartNeeded === true)
+            logEvent('info', 'group', `${name}: ${disable ? 'off' : 'on'} (${results.filter((r) => r.ok && !r.skipped).length}/${group.members.length} applied)`)
+            json(res, 200, { ok: true, results, restartNeeded })
+            return
+          }
+
+          runtime.updateState({ groups })
+          logEvent('info', 'group', `${action} "${name}"`)
+          json(res, 200, { groups })
         },
       })
 
@@ -1134,6 +1251,7 @@ export function mountRoutes(ctx: {
         stopHealth()
         stopSetupPnpm()
         stopToggle()
+        stopGroup()
         stopSnapshots()
         stopRestoreSnapshot()
         stopStatus()

@@ -12,6 +12,12 @@ import { join } from 'node:path'
 
 export const SCHEMA_VERSION = 1 as const
 
+export interface MpGroup {
+  name: string
+  /** Installed package names — a group toggles its members as one unit. */
+  members: string[]
+}
+
 export interface MpState {
   schemaVersion: typeof SCHEMA_VERSION
   /** Anonymous install-telemetry identity: a random UUID, nothing hardware-derived. */
@@ -24,10 +30,17 @@ export interface MpState {
   notes: Record<string, string>
   /** Active theme (plan #23): remembered so switching can auto-disable it. */
   theme: { slug: string; name: string } | null
+  /** Named plugin groups (plan #15): toggle all members as a unit. */
+  groups: MpGroup[]
 }
 
 const MAX_NOTES = 200
 const MAX_NOTE_CHARS = 2000
+const MAX_GROUPS = 20
+const MAX_GROUP_MEMBERS = 50
+
+const GROUP_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} ._-]{0,39}$/u
+export const isValidGroupName = (name: string): boolean => GROUP_NAME_RE.test(name)
 
 function sanitizeNotes(value: unknown): Record<string, string> {
   if (typeof value !== 'object' || value === null) return {}
@@ -50,6 +63,30 @@ function sanitizeTheme(value: unknown): { slug: string; name: string } | null {
   return { slug: rec.slug, name: rec.name }
 }
 
+function sanitizeGroups(value: unknown): MpGroup[] {
+  if (!Array.isArray(value)) return []
+  const out: MpGroup[] = []
+  const seen = new Set<string>()
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const rec = entry as { name?: unknown; members?: unknown }
+    if (typeof rec.name !== 'string' || !GROUP_NAME_RE.test(rec.name)) continue
+    const key = rec.name.toLowerCase()
+    if (seen.has(key) || out.length >= MAX_GROUPS) continue
+    seen.add(key)
+    const members = Array.isArray(rec.members)
+      ? [...new Set(rec.members.filter((m): m is string => typeof m === 'string' && PACKAGE_NAME_RE.test(m)))]
+          .slice(0, MAX_GROUP_MEMBERS)
+      : []
+    out.push({ name: rec.name, members })
+  }
+  return out
+}
+
+// Mirrors routes.ts PACKAGE_RE — duplicated here because routes.ts imports
+// this module (an import back would be circular).
+const PACKAGE_NAME_RE = /^(?:@[a-z0-9-]+\/)?[a-z0-9][a-z0-9._-]{0,119}$/
+
 function defaults(): MpState {
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -58,6 +95,7 @@ function defaults(): MpState {
     favorites: [],
     notes: {},
     theme: null,
+    groups: [],
   }
 }
 
@@ -86,6 +124,7 @@ export function loadMpState(dir: string): MpState {
         : [],
       notes: sanitizeNotes(parsed.notes),
       theme: sanitizeTheme(parsed.theme),
+      groups: sanitizeGroups(parsed.groups),
     }
   } catch {
     return fallback

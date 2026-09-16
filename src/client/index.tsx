@@ -245,7 +245,7 @@ async function pluginAction(route: string, body: Record<string, unknown>): Promi
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
-  return (await res.json().catch(() => ({}))) as { ok?: boolean; output?: string; error?: string }
+  return (await res.json().catch(() => ({}))) as { ok?: boolean; output?: string; error?: string; restartNeeded?: boolean }
 }
 
 async function requestInstall(slug: string, profile: string): Promise<InstallResult> {
@@ -335,6 +335,12 @@ const UI = {
     linkRows: 'Local (link/file) plugins',
     disabledRowsLabel: 'Disabled rows',
     liveRows: 'Hot-mounted now',    origLang: 'Original language',
+    groups: 'Groups',
+    groupsHint: 'Toggle several installed plugins as one unit.',
+    groupPlaceholder: 'New group name…',
+    groupAdd: 'Add',
+    groupEmpty: 'No groups yet.',
+    groupPick: '— plugin —',
     favAdd: 'Add to favorites',
     favRemove: 'Remove from favorites',
     favEmpty: 'Nothing here yet — tap ♥ on a card.',
@@ -425,6 +431,12 @@ const UI = {
     linkRows: '本地 (link/file) 插件',
     disabledRowsLabel: '已禁用的行',
     liveRows: '热挂载中',    origLang: '原文语言',
+    groups: '分组',
+    groupsHint: '一组插件一键启停。',
+    groupPlaceholder: '新分组名称…',
+    groupAdd: '添加',
+    groupEmpty: '暂无分组。',
+    groupPick: '— 插件 —',
     favAdd: '加入收藏',
     favRemove: '取消收藏',
     favEmpty: '还没有收藏 — 点击卡片上的 ♥。',
@@ -515,6 +527,12 @@ const UI = {
     linkRows: 'Локальные (link/file) плагины',
     disabledRowsLabel: 'Отключённые строки',
     liveRows: 'Hot-смонтированы сейчас',    origLang: 'Язык оригинала',
+    groups: 'Группы',
+    groupsHint: 'Включайте и выключайте набор установленных плагинов одним переключателем.',
+    groupPlaceholder: 'Название новой группы…',
+    groupAdd: 'Добавить',
+    groupEmpty: 'Групп пока нет.',
+    groupPick: '— плагин —',
     favAdd: 'В избранное',
     favRemove: 'Убрать из избранного',
     favEmpty: 'Пока пусто — нажмите ♥ на карточке.',
@@ -1964,6 +1982,173 @@ function SettingsView(props: { children?: ReactNode } = {}) {
 }
 
 /** One installed-plugin row: identity, source badge, update + uninstall actions. */
+/** Named set of installed packages (plan #15) — persisted in state.json. */
+interface MpGroupView {
+  name: string
+  members: string[]
+}
+
+const GROUP_ROUTE = '/plugins/dsh-plugins-mp/group'
+
+function GroupRow(props: {
+  group: MpGroupView
+  items: InstalledItem[]
+  onChanged: () => void
+  onNeedsRestart?: () => void
+}) {
+  const t = uiLang()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [pick, setPick] = useState('')
+  const { group } = props
+
+  const installed = props.items.filter((item) => group.members.includes(item.name))
+  // Honest state badge: derived from the actual toggle state of the members,
+  // not from what we last asked for (same reasoning as the theme badges).
+  const allOff = installed.length > 0 && installed.every((item) => item.disabled === true)
+  const candidates = props.items.filter((item) => !group.members.includes(item.name))
+
+  const act = (body: Record<string, unknown>): void => {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    pluginAction(GROUP_ROUTE, body)
+      .then((res) => {
+        if (res.error !== undefined) setError(res.error)
+        else {
+          setPick('')
+          props.onChanged()
+        }
+        if (res.restartNeeded === true) props.onNeedsRestart?.()
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <div style={{ ...S.settingsRow, flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', width: '100%' }}>
+        <span style={S.cardName}>{group.name}</span>
+        <span style={S.muted}>{group.members.length}</span>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button
+            type="button"
+            style={{ ...S.installBtn, ...(allOff ? {} : BADGE_TONE.passed) }}
+            disabled={busy}
+            title={allOff ? t.toggleOn : t.toggleOff}
+            onClick={() => act({ action: 'toggle', name: group.name, disable: !allOff })}
+          >
+            {busy ? '…' : allOff ? t.offBadge : t.liveBadge}
+          </button>
+          <button
+            type="button"
+            style={S.installBtn}
+            disabled={busy}
+            title="✕"
+            onClick={() => act({ action: 'delete', name: group.name })}
+          >
+            ✕
+          </button>
+        </span>
+      </div>
+      {group.members.length > 0 && (
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {group.members.map((member) => (
+            <button
+              key={member}
+              type="button"
+              style={S.chip}
+              disabled={busy}
+              title={member}
+              onClick={() => act({ action: 'remove', name: group.name, member })}
+            >
+              {member} ×
+            </button>
+          ))}
+        </div>
+      )}
+      {candidates.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <select style={{ ...S.select, flex: 1 }} value={pick} onChange={(e) => setPick(e.target.value)}>
+            <option value="">{t.groupPick}</option>
+            {candidates.map((item) => (
+              <option key={item.name} value={item.name}>{item.name}</option>
+            ))}
+          </select>
+          <button
+            type="button"
+            style={S.installBtn}
+            disabled={busy || pick === ''}
+            onClick={() => act({ action: 'add', name: group.name, member: pick })}
+          >
+            {t.groupAdd}
+          </button>
+        </div>
+      )}
+      {error !== null ? <div style={{ ...S.hint, color: '#e5484d' }}>{error}</div> : null}
+    </div>
+  )
+}
+
+/** Groups management block on the "My plugins" tab (#15). */
+function GroupsBlock(props: { items: InstalledItem[]; onChanged: () => void; onNeedsRestart?: () => void }) {
+  const t = uiLang()
+  const [groups, setGroups] = useState<MpGroupView[] | null>(null)
+  const [name, setName] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  const loadGroups = (): void => {
+    fetch(GROUP_ROUTE, { headers: { accept: 'application/json' } })
+      .then((r) => (r.ok ? r.json() : { groups: [] }))
+      .then((d: { groups?: MpGroupView[] }) => setGroups(d.groups ?? []))
+      .catch(() => setGroups([]))
+  }
+  useEffect(loadGroups, [])
+
+  const create = (): void => {
+    const trimmed = name.trim()
+    if (trimmed === '') return
+    setError(null)
+    pluginAction(GROUP_ROUTE, { action: 'create', name: trimmed })
+      .then((res) => {
+        if (res.error !== undefined) setError(res.error)
+        else {
+          setName('')
+          loadGroups()
+        }
+      })
+      .catch((e) => setError(String(e)))
+  }
+
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={S.muted}>{t.groups}</div>
+      <div style={S.hint}>{t.groupsHint}</div>
+      <div style={{ display: 'flex', gap: 6, margin: '6px 0' }}>
+        <input
+          style={{ ...S.search, flex: 1 }}
+          placeholder={t.groupPlaceholder}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') create() }}
+        />
+        <button type="button" style={S.installBtn} disabled={name.trim() === ''} onClick={create}>+</button>
+      </div>
+      {error !== null ? <div style={{ ...S.hint, color: '#e5484d' }}>{error}</div> : null}
+      {groups !== null && groups.length === 0 ? <div style={S.hint}>{t.groupEmpty}</div> : null}
+      {groups?.map((group) => (
+        <GroupRow
+          key={group.name}
+          group={group}
+          items={props.items}
+          onChanged={() => { loadGroups(); props.onChanged() }}
+          onNeedsRestart={props.onNeedsRestart}
+        />
+      ))}
+    </div>
+  )
+}
+
 function InstalledRow(props: {
   item: InstalledItem
   onChange: () => void
@@ -2076,6 +2261,7 @@ function InstalledView(props: { onNeedsRestart?: () => void } = {}) {
         value={query}
         onChange={(e) => setQuery(e.target.value)}
       />
+      <GroupsBlock items={items} onChanged={reload} onNeedsRestart={props.onNeedsRestart} />
       {filtered.length === 0 ? <div style={S.placeholder}>{t.mineEmpty}</div> : null}
       {filtered.map((item) => (
         <InstalledRow key={item.name} item={item} onChange={reload} onNeedsRestart={props.onNeedsRestart} />
