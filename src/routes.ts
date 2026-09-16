@@ -78,6 +78,7 @@ import {
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
 export const SETTINGS_ROUTE = '/plugins/dsh-plugins-mp/settings'
+export const TELEMETRY_ROUTE = '/plugins/dsh-plugins-mp/telemetry-payload'
 export const FAVORITE_ROUTE = '/plugins/dsh-plugins-mp/favorite'
 export const NOTE_ROUTE = '/plugins/dsh-plugins-mp/note'
 export const THEME_ROUTE = '/plugins/dsh-plugins-mp/theme'
@@ -390,6 +391,26 @@ function profileName(config: { profile?: string }): string {
   return config.profile ?? argvProfile() ?? 'web'
 }
 
+/**
+ * Fire-and-forget anonymous telemetry event to the marketplace API (plan 5.1).
+ * Opt-out lives in state.telemetry; any failure is silently ignored — the
+ * marketplace must keep working when the API is unreachable.
+ */
+function sendTelemetryEvent(
+  apiBase: string,
+  state: { fingerprint: string; telemetry: boolean } | undefined,
+  kind: 'install' | 'uninstall' | 'update',
+  slug: string,
+  version: string | null,
+): void {
+  if (state?.telemetry === false || state?.fingerprint === undefined) return
+  void fetch(`${apiBase}/telemetry/event`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fingerprint: state.fingerprint, kind, slug, version, dshVersion: dshHostInfo()?.version ?? null }),
+  }).catch(() => {})
+}
+
 /** Run plain `pnpm <args>` in the profile directory with the repaired env. */
 export function runPnpm(
   profileDir: string,
@@ -646,6 +667,12 @@ export function mountRoutes(ctx: {
                 if (!hot.ok) outcome.hotReason = hot.reason ?? undefined
               }
             }
+            if (outcome.ok) {
+              const installedItem = installedName !== null
+                ? readInstalled(resolveProfileDir({ profile })).find((item) => item.name === installedName)
+                : undefined
+              sendTelemetryEvent(apiBase, runtime?.getState(), 'install', slug, installedItem?.version ?? null)
+            }
             logEvent(outcome.ok ? 'info' : 'warn', 'install',
               `${resolved.source} → profile ${profile}: ${outcome.ok ? `ok${outcome.ignoredBuilds?.length ? `, blocked builds: ${outcome.ignoredBuilds.join(', ')}` : ''}` : `failed (code ${outcome.code}${outcome.timedOut ? ', timed out' : ''})`}`)
             json(res, 200, outcome)
@@ -663,7 +690,10 @@ export function mountRoutes(ctx: {
         path: SETTINGS_ROUTE,
         handler: async (req, res) => {
           if (req.method === 'GET') {
-            json(res, 200, { agentTools: runtime?.agentToolsEnabled() ?? true })
+            json(res, 200, {
+              agentTools: runtime?.agentToolsEnabled() ?? true,
+              telemetry: runtime?.getState().telemetry ?? true,
+            })
             return
           }
           if (req.method !== 'POST') {
@@ -678,20 +708,33 @@ export function mountRoutes(ctx: {
             json(res, 503, { error: 'runtime is not available' })
             return
           }
-          let body: { agentTools?: unknown } = {}
+          let body: { agentTools?: unknown; telemetry?: unknown } = {}
           try {
             body = JSON.parse((await readBody(req)) || '{}')
           } catch {
             json(res, 400, { error: 'invalid JSON body' })
             return
           }
-          if (typeof body.agentTools !== 'boolean') {
-            json(res, 400, { error: 'agentTools must be a boolean' })
-            return
+          if (body.telemetry !== undefined) {
+            if (typeof body.telemetry !== 'boolean') {
+              json(res, 400, { error: 'telemetry must be a boolean' })
+              return
+            }
+            runtime.updateState({ telemetry: body.telemetry })
+            logEvent('info', 'settings', `telemetry ${body.telemetry ? 'enabled' : 'disabled'}`)
           }
-          runtime.setAgentTools(body.agentTools)
-          logEvent('info', 'settings', `agent tools ${body.agentTools ? 'enabled' : 'disabled'}`)
-          json(res, 200, { agentTools: runtime.agentToolsEnabled() })
+          if (body.agentTools !== undefined) {
+            if (typeof body.agentTools !== 'boolean') {
+              json(res, 400, { error: 'agentTools must be a boolean' })
+              return
+            }
+            runtime.setAgentTools(body.agentTools)
+            logEvent('info', 'settings', `agent tools ${body.agentTools ? 'enabled' : 'disabled'}`)
+          }
+          json(res, 200, {
+            agentTools: runtime.agentToolsEnabled(),
+            telemetry: runtime.getState().telemetry,
+          })
         },
       })
 
@@ -838,6 +881,24 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // Telemetry payload (plan 5.1): everything the browser half needs for
+      // the daily heartbeat, assembled server-side from state.json + inventory.
+      const stopTelemetry = webServer.register({
+        kind: 'exact',
+        path: TELEMETRY_ROUTE,
+        handler: (_req, res) => {
+          const state = runtime?.getState()
+          json(res, 200, {
+            fingerprint: state?.fingerprint ?? null,
+            telemetry: state?.telemetry ?? true,
+            dshVersion: dshHostInfo()?.version ?? null,
+            plugins: readInstalled(resolveProfileDir(config))
+              .filter((item) => item.source === 'npm' || item.source === 'github')
+              .map((item) => ({ slug: item.name, version: item.version })),
+          })
+        },
+      })
+
       const stopLogs = webServer.register({
         kind: 'exact',
         path: LOGS_ROUTE,
@@ -899,6 +960,7 @@ export function mountRoutes(ctx: {
             snapshotCreate(profileDir, `before uninstall ${name}`)
             await hotUnmount(name)
             const outcome = await runDshPlugin(profile, ['remove', name])
+            if (outcome.ok) sendTelemetryEvent(apiBase, runtime?.getState(), 'uninstall', name, null)
             logEvent(outcome.ok ? 'info' : 'warn', 'uninstall',
               `${name} from profile ${profile}: ${outcome.ok ? 'removed' : `failed (code ${outcome.code})`}`)
             json(res, 200, outcome)
@@ -966,6 +1028,10 @@ export function mountRoutes(ctx: {
           try {
             snapshotCreate(resolveProfileDir({ profile }), `before update ${name}`)
             const outcome = await runDshPlugin(profile, ['add', `${name}@latest`])
+            if (outcome.ok) {
+              const after = readInstalled(resolveProfileDir({ profile })).find((item) => item.name === name)
+              sendTelemetryEvent(apiBase, runtime?.getState(), 'update', name, after?.version ?? null)
+            }
             logEvent(outcome.ok ? 'info' : 'warn', 'update',
               `${name} in profile ${profile}: ${outcome.ok ? 'updated' : `failed (code ${outcome.code})`}`)
             json(res, 200, outcome)
@@ -1902,6 +1968,7 @@ export function mountRoutes(ctx: {
         stopConfig()
         stopInstall()
         stopSettings()
+        stopTelemetry()
         stopFavorite()
         stopNote()
         stopTheme()

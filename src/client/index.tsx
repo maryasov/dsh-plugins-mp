@@ -56,6 +56,7 @@ const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
 const NOTE_ROUTE = '/plugins/dsh-plugins-mp/note'
 const SETTINGS_ROUTE = '/plugins/dsh-plugins-mp/settings'
+const TELEMETRY_PAYLOAD_ROUTE = '/plugins/dsh-plugins-mp/telemetry-payload'
 const LOGS_ROUTE = '/plugins/dsh-plugins-mp/logs'
 
 // The client appends /plugins, /categories, … to the base, so it must carry the
@@ -308,8 +309,8 @@ const UI = {
     eventLog: 'Event log',
     eventLogHint: 'A sanitized log of what the plugin did — for bug reports. Nothing is sent anywhere.',
     download: 'Download',
-    installStats: 'Install statistics',
-    installStatsSoon: 'planned',
+    telemetryTitle: 'Install statistics',
+    telemetryHint: 'Anonymous only: a random UUID (nothing hardware-derived), a daily heartbeat and install/update events power the trending list. No personal data, opt out anytime.',
     mineEmpty: 'Nothing installed yet.',
     uninstall: 'Uninstall',
     confirmUninstall: 'Remove?',
@@ -433,8 +434,8 @@ const UI = {
     eventLog: '事件日志',
     eventLogHint: '插件操作的脱敏日志 — 用于错误报告。不会发送到任何地方。',
     download: '下载',
-    installStats: '安装统计',
-    installStatsSoon: '计划中',
+    telemetryTitle: '安装统计',
+    telemetryHint: '完全匿名：随机 UUID（与硬件无关）、每日心跳和安装/更新事件用于热门榜。不含个人数据，可随时关闭。',
     mineEmpty: '还没有安装任何插件。',
     uninstall: '卸载',
     confirmUninstall: '确认删除？',
@@ -558,8 +559,8 @@ const UI = {
     eventLog: 'Журнал событий',
     eventLogHint: 'Очищенный лог действий плагина — для отчётов об ошибках. Никуда не отправляется.',
     download: 'Скачать',
-    installStats: 'Статистика установок',
-    installStatsSoon: 'планируется',
+    telemetryTitle: 'Статистика установок',
+    telemetryHint: 'Полностью анонимно: случайный UUID (не привязан к железу), heartbeat раз в день и события установки/обновления питают список трендов. Никаких личных данных, отключается в любой момент.',
     mineEmpty: 'Пока ничего не установлено.',
     uninstall: 'Удалить',
     confirmUninstall: 'Удалить?',
@@ -2343,12 +2344,56 @@ function SettingsView(props: { children?: ReactNode; onNeedsRestart?: () => void
       {props.children}
       <BackupSection onNeedsRestart={props.onNeedsRestart} />
       <SyncSection onNeedsRestart={props.onNeedsRestart} />
-      <div style={{ ...S.settingsRow, opacity: 0.55 }}>
-        <div style={S.settingsText}>
-          <div style={S.settingsName}>{t.installStats}</div>
-          <div style={S.hint}>{t.installStatsSoon}</div>
-        </div>
+      <TelemetryRow />
+    </div>
+  )
+}
+
+/** Anonymous install telemetry opt-out (plan 5.1) — on by default. */
+function TelemetryRow() {
+  const t = UI[useUiLang()] as UiDict
+  const [on, setOn] = useState<boolean | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    fetch(SETTINGS_ROUTE, { headers: { accept: 'application/json' } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { telemetry?: boolean } | null) => { if (alive) setOn(d?.telemetry !== false) })
+      .catch(() => { if (alive) setOn(true) })
+    return () => { alive = false }
+  }, [])
+
+  const flip = (): void => {
+    if (on === null || busy) return
+    setBusy(true)
+    fetch(SETTINGS_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ telemetry: !on }),
+    })
+      .then(async (res) => {
+        const body = (await res.json().catch(() => ({}))) as { telemetry?: boolean }
+        if (res.ok) setOn(body.telemetry !== false)
+      })
+      .catch(() => {})
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <div style={S.settingsRow}>
+      <div style={S.settingsText}>
+        <div style={S.settingsName}>{t.telemetryTitle}</div>
+        <div style={S.hint}>{t.telemetryHint}</div>
       </div>
+      <button
+        type="button"
+        style={{ ...S.toggle, ...(on ? S.toggleOn : {}) }}
+        disabled={on === null || busy}
+        onClick={flip}
+      >
+        {on === null ? t.loading : busy ? t.saving : on ? t.on : t.off}
+      </button>
     </div>
   )
 }
@@ -3155,6 +3200,40 @@ function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
   useEffect(() => {
     ensureFavorites()
     return installClientStyle()
+  }, [])
+
+  // Daily anonymous heartbeat (plan 5.1): ≤1/day per profile, gated locally
+  // and server-side; the payload is assembled by the host (fingerprint +
+  // installed npm/github packages), the browser adds the UI locale.
+  useEffect(() => {
+    let last = 0
+    try { last = Number(localStorage.getItem('dsh-mp-last-hb')) || 0 } catch { /* storage unavailable */ }
+    if (Date.now() - last < 24 * 3600_000) return
+    void (async () => {
+      try {
+        const res = await fetch(TELEMETRY_PAYLOAD_ROUTE, { headers: { accept: 'application/json' } })
+        if (!res.ok) return
+        const payload = (await res.json()) as {
+          fingerprint?: string | null
+          telemetry?: boolean
+          dshVersion?: string | null
+          plugins?: Array<{ slug: string; version?: string | null }>
+        }
+        if (payload.telemetry === false || payload.fingerprint === null || payload.fingerprint === undefined) return
+        await ensureApiBase()
+        await fetch(`${API_BASE}/telemetry/heartbeat`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            fingerprint: payload.fingerprint,
+            dshVersion: payload.dshVersion,
+            locale: langCode(),
+            plugins: payload.plugins ?? [],
+          }),
+        })
+        try { localStorage.setItem('dsh-mp-last-hb', String(Date.now())) } catch { /* ignore */ }
+      } catch { /* telemetry must never break the market */ }
+    })()
   }, [])
 
   useEffect(() => {

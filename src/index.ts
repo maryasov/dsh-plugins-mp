@@ -336,7 +336,7 @@ function registerTools(ctx: MpContext, apiBase: string): () => void {
         `Top marketplace plugins: by GitHub stars, by weekly npm downloads, or recently updated. ` +
         `Use when the user asks what is popular/trending.`,
       parameters: {
-        by: { type: 'string', description: 'Ranking metric.', enum: ['stars', 'downloads', 'updated'] },
+        by: { type: 'string', description: 'Ranking metric. installs = real anonymous install counts (trailing 7 days).', enum: ['installs', 'stars', 'downloads', 'updated'] },
         limit: { type: 'number', description: 'How many, 1-25 (default 10).' },
         lang: LANG_PARAM,
       },
@@ -354,19 +354,51 @@ function registerTools(ctx: MpContext, apiBase: string): () => void {
       async execute(args, exec): Promise<ObjValue> {
         const lang = pickLang(args.lang)
         const t = labels(lang)
-        const by = args.by === 'downloads' || args.by === 'updated' ? args.by : 'stars'
-        const catalog = await fetchCatalog(
-          apiBase,
-          { sort: by === 'downloads' ? 'stars' : by, limit: Math.min(args.limit ?? 10, 25) },
-          exec.signal,
-        )
-        let items = catalog.items
-        if (by === 'downloads') {
-          items = [...items].sort((a, b) => b.npmDownloadsWeek - a.npmDownloadsWeek)
+        const by = ['installs', 'stars', 'downloads', 'updated'].includes(args.by) ? args.by : 'installs'
+        const limit = Math.min(args.limit ?? 10, 25)
+        let metric = by
+        let cards: MpCard[] = []
+        if (by === 'installs') {
+          // Real install counts (anonymous telemetry); falls back to stars
+          // while the trending table is still empty.
+          try {
+            const trend = await api<Array<{ slug: string; installs: number }>>(
+              apiBase,
+              '/trending?days=7&limit=' + String(limit),
+              exec.signal,
+            )
+            if (trend.length > 0) {
+              const catalog = await fetchCatalog(
+                apiBase,
+                { slugs: trend.map((entry) => entry.slug), limit: Math.max(limit, trend.length) },
+                exec.signal,
+              )
+              const bySlug = new Map(catalog.items.map((card) => [card.slug, card]))
+              cards = trend
+                .map((entry) => bySlug.get(entry.slug))
+                .filter((card): card is MpCard => card !== undefined)
+              metric = 'installs'
+            } else {
+              metric = 'stars'
+            }
+          } catch {
+            metric = 'stars'
+          }
+        }
+        if (metric !== 'installs') {
+          const catalog = await fetchCatalog(
+            apiBase,
+            { sort: metric === 'downloads' ? 'stars' : metric, limit },
+            exec.signal,
+          )
+          cards = catalog.items
+          if (metric === 'downloads') {
+            cards = [...cards].sort((a, b) => b.npmDownloadsWeek - a.npmDownloadsWeek)
+          }
         }
         return {
-          plugins: items.map((card) => compactCard(card, lang)),
-          text: t.trending(by),
+          plugins: cards.map((card) => compactCard(card, lang)),
+          text: t.trending(metric),
         }
       },
     }),

@@ -172,6 +172,7 @@ export function fetchCatalog(
     category?: string
     profile?: string
     installable?: boolean
+    slugs?: string[]
     sort?: string
     limit?: number
     page?: number
@@ -183,6 +184,7 @@ export function fetchCatalog(
   if (query.category) usp.set('category', query.category)
   if (query.profile) usp.set('profile', query.profile)
   if (query.installable) usp.set('installable', '1')
+  if (query.slugs !== undefined && query.slugs.length > 0) usp.set('slugs', query.slugs.join(','))
   if (query.sort) usp.set('sort', query.sort)
   usp.set('limit', String(Math.min(query.limit ?? 12, 25)))
   usp.set('page', String(query.page ?? 1))

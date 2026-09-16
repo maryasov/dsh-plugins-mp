@@ -32,6 +32,8 @@ export interface MpState {
   fingerprint: string
   /** Whether the five mp_* model-facing tools are registered (Settings toggle). */
   agentTools: boolean
+  /** Anonymous install telemetry opt-out (plan 5.1): true unless the user declines. */
+  telemetry: boolean
   /** Favorite marketplace slugs (Favorites tab), capped defensively. */
   favorites: string[]
   /** Per-plugin notes (plan #21, v1 local): slug → free-form text. */
@@ -111,6 +113,7 @@ function defaults(): MpState {
     schemaVersion: SCHEMA_VERSION,
     fingerprint: randomUUID(),
     agentTools: true,
+    telemetry: true,
     favorites: [],
     notes: {},
     theme: null,
@@ -137,6 +140,7 @@ export function loadMpState(dir: string): MpState {
         ? parsed.fingerprint
         : fallback.fingerprint,
       agentTools: parsed.agentTools !== false,
+      telemetry: parsed.telemetry !== false,
       favorites: Array.isArray(parsed.favorites)
         ? parsed.favorites
             .filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length <= 200)
