@@ -67,6 +67,12 @@ function normalizeBase(base: string): string {
   return b
 }
 
+// The marketplace website that lives next to the API (comments are read-only
+// here; posting happens on the site where the GitHub session lives).
+function siteOrigin(): string {
+  return API_BASE.replace(/\/api\/?$/, '')
+}
+
 // Fetch the resolved backend once and remember it. Never throws — on any
 // failure we keep the hosting backend so the tab always works. Memoized by
 // promise so concurrent callers share a single /config fetch.
@@ -122,6 +128,18 @@ interface MpTestRun {
   releaseIndex: number
   profile: string
   status: CompatStatus
+}
+
+interface MpComment {
+  id: string
+  author: { login: string; name: string | null; avatarUrl: string | null }
+  bodyMd: string
+  createdAt: string
+}
+
+interface MpComments {
+  items: MpComment[]
+  total: number
 }
 
 interface MpDetail {
@@ -326,6 +344,9 @@ const UI = {
     noteSave: 'Save note',
     noteSaved: 'Saved',
     changelog: 'Release notes',
+    comments: 'Comments',
+    commentsEmpty: 'No comments yet.',
+    discussOnSite: 'Discuss on the site',
     themeApply: 'Apply',
     themeActive: 'Active theme',
     themeEnable: 'Enable',
@@ -413,6 +434,9 @@ const UI = {
     noteSave: '保存笔记',
     noteSaved: '已保存',
     changelog: '发布说明',
+    comments: '评论',
+    commentsEmpty: '暂无评论。',
+    discussOnSite: '到网站上讨论',
     themeApply: '应用',
     themeActive: '当前主题',
     themeEnable: '启用',
@@ -500,6 +524,9 @@ const UI = {
     noteSave: 'Сохранить заметку',
     noteSaved: 'Сохранено',
     changelog: 'Что нового',
+    comments: 'Комментарии',
+    commentsEmpty: 'Пока нет комментариев.',
+    discussOnSite: 'Обсудить на сайте',
     themeApply: 'Применить',
     themeActive: 'Активная тема',
     themeEnable: 'Включить',
@@ -1410,6 +1437,7 @@ function DetailView(props: {
   const [note, setNote] = useState('')
   const [noteState, setNoteState] = useState<'idle' | 'busy' | 'saved'>('idle')
   const [openChangelog, setOpenChangelog] = useState<string | null>(null)
+  const [comments, setComments] = useState<MpComments | null>(null)
 
   useEffect(() => {
     const ctrl = new AbortController()
@@ -1421,6 +1449,7 @@ function DetailView(props: {
     setNote('')
     setNoteState('idle')
     setOpenChangelog(null)
+    setComments(null)
     api<MpDetail>(`/plugins/${encodeURIComponent(props.slug)}`, ctrl.signal)
       .then(setDetail)
       .catch((e) => {
@@ -1432,6 +1461,11 @@ function DetailView(props: {
     // language here.
     api<MpReadme>(`/plugins/${encodeURIComponent(props.slug)}/readme?locale=${langCode()}`, ctrl.signal)
       .then(setReadme)
+      .catch(() => {})
+    // Comments are read-only in the plugin (v1): posting lives on the website
+    // where the GitHub OAuth session is.
+    api<MpComments>(`/plugins/${encodeURIComponent(props.slug)}/comments`, ctrl.signal)
+      .then(setComments)
       .catch(() => {})
     fetch(NOTE_ROUTE, { headers: { accept: 'application/json' }, signal: ctrl.signal })
       .then((r) => (r.ok ? r.json() : null))
@@ -1743,6 +1777,35 @@ function DetailView(props: {
                 </div>
               )
             })}
+          </div>
+        )}
+        {comments !== null && (
+          <div style={{ marginTop: 16 }}>
+            <div style={{ ...S.muted, marginBottom: 4 }}>
+              {t.comments}{comments.total > 0 ? ` · ${comments.total}` : ''}
+            </div>
+            {comments.items.length === 0 && <div style={S.muted}>{t.commentsEmpty}</div>}
+            {comments.items.map((c) => (
+              <div
+                key={c.id}
+                style={{ margin: '6px 0', paddingLeft: 10, borderLeft: '2px solid var(--dsw-alias-border, rgba(128,128,128,0.35))' }}
+              >
+                <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+                  <span style={{ fontWeight: 600 }}>{c.author.name || c.author.login}</span>
+                  <span style={S.muted}>{fmtDate(c.createdAt) ?? ''}</span>
+                </div>
+                {/* изображения в комментариях не рендерим (трекинг-пиксели) */}
+                <Markdown source={c.bodyMd.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')} />
+              </div>
+            ))}
+            <a
+              href={`${siteOrigin()}/${langCode()}/plugins/${encodeURIComponent(props.slug)}`}
+              target="_blank"
+              rel="noreferrer"
+              style={{ fontSize: 12 }}
+            >
+              {t.discussOnSite} ↗
+            </a>
           </div>
         )}
         {similar.length > 0 && (
