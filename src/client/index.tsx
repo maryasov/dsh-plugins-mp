@@ -239,13 +239,13 @@ async function fetchUpdates(): Promise<Record<string, { latest: string | null; u
   }
 }
 
-async function pluginAction(route: string, body: Record<string, unknown>): Promise<{ ok?: boolean; output?: string; error?: string; restartNeeded?: boolean }> {
+async function pluginAction(route: string, body: Record<string, unknown>): Promise<{ ok?: boolean; output?: string; error?: string; restartNeeded?: boolean; moved?: number; conflicts?: Array<{ name: string; reason: string }> }> {
   const res = await fetch(route, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
-  return (await res.json().catch(() => ({}))) as { ok?: boolean; output?: string; error?: string; restartNeeded?: boolean }
+  return (await res.json().catch(() => ({}))) as { ok?: boolean; output?: string; error?: string; restartNeeded?: boolean; moved?: number; conflicts?: Array<{ name: string; reason: string }> }
 }
 
 async function requestInstall(slug: string, profile: string): Promise<InstallResult> {
@@ -341,6 +341,13 @@ const UI = {
     groupAdd: 'Add',
     groupEmpty: 'No groups yet.',
     groupPick: '— plugin —',
+    orderTitle: 'Load order',
+    orderHint: 'The order plugins are composed in. In-box bundles are fixed; applies after a restart. A broken order is refused by a boot trial.',
+    orderApply: 'Apply',
+    orderConflicts: 'Order rules violated:',
+    orderTrialFailed: 'Trial composition failed — rolled back.',
+    orderMoved: 'entries moved',
+    orderEmpty: 'No reorderable bundles.',
     favAdd: 'Add to favorites',
     favRemove: 'Remove from favorites',
     favEmpty: 'Nothing here yet — tap ♥ on a card.',
@@ -437,6 +444,13 @@ const UI = {
     groupAdd: '添加',
     groupEmpty: '暂无分组。',
     groupPick: '— 插件 —',
+    orderTitle: '加载顺序',
+    orderHint: '插件在配置中的加载顺序。官方捆绑包固定；重启后生效。坏顺序会被试启动拒绝。',
+    orderApply: '应用',
+    orderConflicts: '违反了顺序规则：',
+    orderTrialFailed: '试组装失败 — 已回滚。',
+    orderMoved: '个条目移动',
+    orderEmpty: '无可排序捆绑包。',
     favAdd: '加入收藏',
     favRemove: '取消收藏',
     favEmpty: '还没有收藏 — 点击卡片上的 ♥。',
@@ -533,6 +547,13 @@ const UI = {
     groupAdd: 'Добавить',
     groupEmpty: 'Групп пока нет.',
     groupPick: '— плагин —',
+    orderTitle: 'Порядок загрузки',
+    orderHint: 'Порядок подключения плагинов в профиле. Официальные бандлы фиксированы; применится после перезапуска. Нерабочий порядок отклонит пробная сборка.',
+    orderApply: 'Применить',
+    orderConflicts: 'Нарушены правила порядка:',
+    orderTrialFailed: 'Пробная сборка не прошла — порядок откачен.',
+    orderMoved: 'записей переставлено',
+    orderEmpty: 'Нет переставляемых бандлов.',
     favAdd: 'В избранное',
     favRemove: 'Убрать из избранного',
     favEmpty: 'Пока пусто — нажмите ♥ на карточке.',
@@ -2149,6 +2170,118 @@ function GroupsBlock(props: { items: InstalledItem[]; onChanged: () => void; onN
   )
 }
 
+const ORDER_ROUTE = '/plugins/dsh-plugins-mp/order'
+
+interface OrderStack {
+  bundles: string[]
+  community: string[]
+  conflicts: Array<{ name: string; reason: string }>
+}
+
+/** Bundle load order editor (plan #16): drag or ↑/↓, then a trial-validated apply. */
+function OrderBlock(props: { onNeedsRestart?: () => void }) {
+  const t = uiLang()
+  const [stack, setStack] = useState<OrderStack | null>(null)
+  const [order, setOrder] = useState<string[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [saved, setSaved] = useState<string | null>(null)
+  const [dragIndex, setDragIndex] = useState<number | null>(null)
+
+  const load = (): void => {
+    fetch(ORDER_ROUTE, { headers: { accept: 'application/json' } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: OrderStack | null) => {
+        if (d !== null) {
+          setStack(d)
+          setOrder(d.community)
+        }
+      })
+      .catch(() => {})
+  }
+  useEffect(load, [])
+
+  const dirty = stack !== null && order.join('\u0000') !== stack.community.join('\u0000')
+
+  const move = (from: number, to: number): void => {
+    setOrder((prev) => {
+      const next = [...prev]
+      const [item] = next.splice(from, 1)
+      if (item === undefined) return prev
+      next.splice(Math.max(0, Math.min(next.length, to)), 0, item)
+      return next
+    })
+  }
+
+  const apply = (): void => {
+    if (busy || !dirty) return
+    setBusy(true)
+    setError(null)
+    setSaved(null)
+    pluginAction(ORDER_ROUTE, { order })
+      .then((res) => {
+        if (res.error !== undefined) {
+          setError(
+            res.conflicts !== undefined && res.conflicts.length > 0
+              ? `${t.orderConflicts} ${res.conflicts.map((c) => `${c.name}: ${c.reason}`).join('; ')}`
+              : `${t.orderTrialFailed}${res.output !== undefined ? '' : ` ${res.error}`}`,
+          )
+        } else {
+          setSaved(typeof res.moved === 'number' ? `${res.moved} ${t.orderMoved}` : t.orderApply)
+          props.onNeedsRestart?.()
+          load()
+        }
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setBusy(false))
+  }
+
+  if (stack === null) return null
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={S.muted}>{t.orderTitle}</div>
+      <div style={S.hint}>{t.orderHint}</div>
+      {stack.conflicts.length > 0 && (
+        <div style={{ ...S.hint, color: '#f5a623', marginTop: 4 }}>
+          {t.orderConflicts}
+          <ul style={{ margin: '2px 0 0 16px' }}>
+            {stack.conflicts.map((c, i) => <li key={i}>{c.name}: {c.reason}</li>)}
+          </ul>
+        </div>
+      )}
+      {order.length === 0 ? <div style={S.hint}>{t.orderEmpty}</div> : (
+        <div style={{ margin: '6px 0' }}>
+          {order.map((name, i) => (
+            <div
+              key={name}
+              draggable
+              onDragStart={() => setDragIndex(i)}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={() => {
+                if (dragIndex !== null && dragIndex !== i) move(dragIndex, i)
+                setDragIndex(null)
+              }}
+              onDragEnd={() => setDragIndex(null)}
+              style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '2px 0', opacity: dragIndex === i ? 0.5 : 1 }}
+            >
+              <span style={{ ...S.muted, width: 20, textAlign: 'right', flexShrink: 0 }}>{i + 1}</span>
+              <span style={{ cursor: 'grab', userSelect: 'none', flexShrink: 0 }}>≡</span>
+              <span style={{ flex: 1, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+              <button type="button" style={S.installBtn} disabled={i === 0} onClick={() => move(i, i - 1)}>↑</button>
+              <button type="button" style={S.installBtn} disabled={i === order.length - 1} onClick={() => move(i, i + 1)}>↓</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <button type="button" style={{ ...S.installBtn, marginLeft: 0 }} disabled={!dirty || busy} onClick={apply}>
+        {busy ? '…' : t.orderApply}
+      </button>
+      {saved !== null && <span style={{ ...S.hint, marginLeft: 8 }}>{saved}</span>}
+      {error !== null ? <div style={{ ...S.hint, color: '#e5484d', marginTop: 4 }}>{error}</div> : null}
+    </div>
+  )
+}
+
 function InstalledRow(props: {
   item: InstalledItem
   onChange: () => void
@@ -2262,6 +2395,7 @@ function InstalledView(props: { onNeedsRestart?: () => void } = {}) {
         onChange={(e) => setQuery(e.target.value)}
       />
       <GroupsBlock items={items} onChanged={reload} onNeedsRestart={props.onNeedsRestart} />
+      <OrderBlock onNeedsRestart={props.onNeedsRestart} />
       {filtered.length === 0 ? <div style={S.placeholder}>{t.mineEmpty}</div> : null}
       {filtered.map((item) => (
         <InstalledRow key={item.name} item={item} onChange={reload} onNeedsRestart={props.onNeedsRestart} />

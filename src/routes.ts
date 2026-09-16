@@ -39,6 +39,16 @@ import { isDisabledByPatch, setPatchDisabled } from './toggle.js'
 import { statusFingerprint, successorPending, triggerRestart } from './restart.js'
 import { allowBuildsAdd } from './workspace-yaml.js'
 import { isValidGroupName, type MpGroup } from './store.js'
+import { argvProfile } from './mp-home.js'
+import {
+  applyBundleOrder,
+  mergeOrder,
+  readBundleRules,
+  readBundleStack,
+  validateOrder,
+  writeFileAtomic,
+  type OrderConflict,
+} from './order.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
@@ -55,6 +65,7 @@ export const HEALTH_ROUTE = '/plugins/dsh-plugins-mp/health'
 export const SETUP_PNPM_ROUTE = '/plugins/dsh-plugins-mp/setup-pnpm'
 export const TOGGLE_ROUTE = '/plugins/dsh-plugins-mp/toggle'
 export const GROUP_ROUTE = '/plugins/dsh-plugins-mp/group'
+export const ORDER_ROUTE = '/plugins/dsh-plugins-mp/order'
 export const SNAPSHOTS_ROUTE = '/plugins/dsh-plugins-mp/snapshots'
 export const RESTORE_SNAPSHOT_ROUTE = '/plugins/dsh-plugins-mp/restore-snapshot'
 export const STATUS_ROUTE = '/plugins/dsh-plugins-mp/status'
@@ -285,6 +296,64 @@ export function runDshPluginAdd(
   timeoutMs = INSTALL_TIMEOUT_MS,
 ): Promise<InstallOutcome> {
   return runDshPlugin(profile, ['add', source], timeoutMs)
+}
+
+/** One arbitrary `dsh <args…>` invocation (boot trial: `--dump-config`). */
+export function runDshCli(
+  args: readonly string[],
+  timeoutMs = INSTALL_TIMEOUT_MS,
+): Promise<{ ok: boolean; code: number | null; output: string; timedOut: boolean }> {
+  const commands = dshCommands()
+  const env = spawnEnv()
+  return new Promise((resolve) => {
+    let output = ''
+    let timedOut = false
+    const collect = (buf: Buffer): void => {
+      output += buf.toString('utf8')
+      if (output.length > MAX_OUTPUT_CHARS) output = output.slice(-MAX_OUTPUT_CHARS)
+    }
+    const attempt = (index: number): void => {
+      if (index >= commands.length) {
+        resolve({ ok: false, code: null, output: `dsh CLI not found (tried: ${commands.map((c) => c.label).join(', ')})`, timedOut })
+        return
+      }
+      const cmd = commands[index]
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const child = spawn(cmd.argv[0], [...cmd.argv.slice(1), ...args], { cwd: cmd.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
+      child.stdout?.on('data', collect)
+      child.stderr?.on('data', collect)
+      child.on('error', (error: NodeJS.ErrnoException) => {
+        if (timer) clearTimeout(timer)
+        if (error.code === 'ENOENT' && index < commands.length - 1) {
+          child.removeAllListeners('close')
+          attempt(index + 1)
+          return
+        }
+        resolve({ ok: false, code: null, output: `${output}\n${String(error)}`.trim(), timedOut })
+      })
+      timer = setTimeout(() => {
+        timedOut = true
+        child.kill('SIGKILL')
+      }, timeoutMs)
+      child.on('close', (code) => {
+        if (timer) clearTimeout(timer)
+        resolve({ ok: code === 0 && !timedOut, code, output: output.trim(), timedOut })
+      })
+    }
+    attempt(0)
+  })
+}
+
+/** Entry ids in composition order, parsed from a `dsh --dump-config` dump. */
+function parseEntryIds(dump: string): string[] {
+  const ids: string[] = []
+  for (const m of dump.matchAll(/^\s*-\s*id:\s*['"]?([^'"\s]+)/gm)) ids.push(m[1] ?? '')
+  return ids
+}
+
+/** The profile name for CLI invocations — same resolution as resolveProfileDir. */
+function profileName(config: { profile?: string }): string {
+  return config.profile ?? argvProfile() ?? 'web'
 }
 
 /** Run plain `pnpm <args>` in the profile directory with the repaired env. */
@@ -1127,6 +1196,118 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // Bundle load order (plan #16): GET returns the stack + rule conflicts
+      // of the CURRENT order; POST { order } reorders the community bundles
+      // (in-box bundles stay put). The candidate is trial-composed with the
+      // REAL boot (`dsh --dump-config`) after the manifest write — on failure
+      // the previous manifest text is restored atomically, so a broken order
+      // can never survive.
+      const stopOrder = webServer.register({
+        kind: 'exact',
+        path: ORDER_ROUTE,
+        handler: async (req, res) => {
+          const profileDir = resolveProfileDir(config)
+          const trial = async (): Promise<{ ok: boolean; output: string }> => {
+            const r = await runDshCli(['--dump-config', '--profile', profileName(config)], 120_000)
+            return { ok: r.ok, output: r.output }
+          }
+          if (req.method === 'GET') {
+            const stack = readBundleStack(profileDir)
+            json(res, 200, {
+              bundles: stack.bundles,
+              community: stack.community,
+              conflicts: validateOrder(stack.bundles, readBundleRules(profileDir)),
+            })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          let body: { order?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const order = Array.isArray(body.order)
+            ? body.order.filter((item): item is string => typeof item === 'string')
+            : []
+          if (order.length === 0) {
+            json(res, 400, { error: 'order must be a non-empty array of bundle names' })
+            return
+          }
+
+          // The reorder writes package.json directly — same mutex as installs
+          // so a concurrent pnpm run can never interleave.
+          if (installing) {
+            json(res, 409, { error: 'another install is already in progress' })
+            return
+          }
+          installing = true
+          try {
+            const stack = readBundleStack(profileDir)
+            const merged = mergeOrder(stack.bundles, order)
+            if (!merged.ok) {
+              json(res, 400, { error: merged.error })
+              return
+            }
+            const conflicts: OrderConflict[] = validateOrder(merged.bundles, readBundleRules(profileDir))
+            if (conflicts.length > 0) {
+              json(res, 422, { error: 'the order violates declared before/after rules', conflicts })
+              return
+            }
+            if (merged.bundles.join('\u0000') === stack.bundles.join('\u0000')) {
+              json(res, 200, { ok: true, unchanged: true, bundles: stack.bundles })
+              return
+            }
+
+            // Composition entry order BEFORE, for the what-changed report.
+            const beforeDump = await trial()
+            const beforeIds = beforeDump.ok ? parseEntryIds(beforeDump.output) : []
+
+            snapshotCreate(profileDir, 'before bundle order')
+            const manifestPath = join(profileDir, 'package.json')
+            const originalText = readFileSync(manifestPath, 'utf8')
+            const applied = applyBundleOrder(profileDir, order)
+            if (!applied.ok) {
+              json(res, 400, { error: applied.error })
+              return
+            }
+
+            // Boot trial on the real machinery. Fail → restore the original
+            // manifest text and refuse; the profile is never left broken.
+            const after = await trial()
+            if (!after.ok) {
+              writeFileAtomic(manifestPath, originalText)
+              logEvent('warn', 'order', `rejected by boot trial — manifest restored`)
+              json(res, 422, {
+                error: 'trial composition failed — the order was rolled back',
+                output: after.output.slice(-2000),
+              })
+              return
+            }
+
+            // What changed: entry ids whose position the reorder moved.
+            const afterIds = parseEntryIds(after.output)
+            const beforePos = new Map(beforeIds.map((id, i) => [id, i]))
+            const moved = afterIds.filter((id, i) => beforePos.get(id) !== i)
+            logEvent('info', 'order', `applied community order (${moved.length} entries moved)`)
+            // The running composition keeps the old order until a restart.
+            json(res, 200, { ok: true, bundles: applied.bundles, moved, restartNeeded: true })
+          } catch (error) {
+            json(res, 500, { error: String(error instanceof Error ? error.message : error) })
+          } finally {
+            installing = false
+          }
+        },
+      })
+
       const stopSnapshots = webServer.register({
         kind: 'exact',
         path: SNAPSHOTS_ROUTE,
@@ -1252,6 +1433,7 @@ export function mountRoutes(ctx: {
         stopSetupPnpm()
         stopToggle()
         stopGroup()
+        stopOrder()
         stopSnapshots()
         stopRestoreSnapshot()
         stopStatus()
