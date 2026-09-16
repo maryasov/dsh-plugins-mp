@@ -36,7 +36,7 @@ import { cleanHotDir, hotMount, hotUnmount, listHotMounts, readUserPatchControls
 import type { MpRuntime } from './runtime.js'
 import { snapshotCreate, snapshotDelete, snapshotList, snapshotRestore } from './snapshot.js'
 import { isDisabledByPatch, setPatchDisabled } from './toggle.js'
-import { statusFingerprint, successorPending, triggerRestart } from './restart.js'
+import { detectSystemd, statusFingerprint, successorPending, triggerRestart } from './restart.js'
 import { allowBuildsAdd } from './workspace-yaml.js'
 import { isValidGroupName, type MpGroup } from './store.js'
 import { argvProfile } from './mp-home.js'
@@ -69,6 +69,11 @@ import {
   uploadWebdav,
   verifyGistToken,
 } from './sync-backup.js'
+import {
+  UPDATE_API_V1_SCHEMA,
+  UpdateOperationStoreV1,
+  apiBootId,
+} from './update-api.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
@@ -88,6 +93,11 @@ export const GROUP_ROUTE = '/plugins/dsh-plugins-mp/group'
 export const ORDER_ROUTE = '/plugins/dsh-plugins-mp/order'
 export const BACKUP_ROUTE = '/plugins/dsh-plugins-mp/backup'
 export const SYNC_ROUTE = '/plugins/dsh-plugins-mp/sync'
+export const API_V1_CAPABILITIES_ROUTE = '/plugins/dsh-plugins-mp/api/v1/capabilities'
+export const API_V1_UPDATES_ROUTE = '/plugins/dsh-plugins-mp/api/v1/updates'
+export const API_V1_OPERATIONS_ROUTE = '/plugins/dsh-plugins-mp/api/v1/operations'
+export const API_V1_ROLLBACK_ROUTE = '/plugins/dsh-plugins-mp/api/v1/rollback'
+export const API_V1_RESTART_ROUTE = '/plugins/dsh-plugins-mp/api/v1/restart'
 export const SNAPSHOTS_ROUTE = '/plugins/dsh-plugins-mp/snapshots'
 export const RESTORE_SNAPSHOT_ROUTE = '/plugins/dsh-plugins-mp/restore-snapshot'
 export const STATUS_ROUTE = '/plugins/dsh-plugins-mp/status'
@@ -500,6 +510,8 @@ export function mountRoutes(ctx: {
 }, config: MpApiConfig & { profile?: string } = {}, runtime?: MpRuntime): void {
   const apiBase = resolveApiBase(config)
   let installing = false
+  // Public update API v1 (#27): process-local operation registry.
+  const operationsV1 = new UpdateOperationStoreV1(apiBootId())
 
   const resolveCommand = async (
     slug: string,
@@ -1555,6 +1567,228 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // ------------------------------------------------------------------
+      // Public update API v1 (#27): a stable envelope for third-party
+      // plugins/tools. GETs are public reads; mutations are same-origin and
+      // reuse the exact executors behind the UI routes.
+      // ------------------------------------------------------------------
+
+      const installedVersionOf = (profileDir: string, name: string): string | null =>
+        readInstalled(profileDir).find((item) => item.name === name)?.version ?? null
+
+      const stopV1Capabilities = webServer.register({
+        kind: 'exact',
+        path: API_V1_CAPABILITIES_ROUTE,
+        handler: (_req, res) => {
+          const systemd = detectSystemd()
+          json(res, 200, {
+            schema: UPDATE_API_V1_SCHEMA,
+            apiVersion: 1,
+            stability: 'beta',
+            profile: profileName(config),
+            runtime: 'web',
+            features: {
+              check: true,
+              update: true,
+              progress: true,
+              rollback: true,
+              restart: true,
+            },
+            restart: {
+              supported: true,
+              managedBy: systemd.unit !== null && systemd.isMain ? 'systemd' : 'successor-script',
+              supervisor: systemd.unit,
+            },
+            operationRetention: 'current-process',
+            operationLimit: 50,
+            endpoints: {
+              updates: API_V1_UPDATES_ROUTE,
+              operations: API_V1_OPERATIONS_ROUTE,
+              rollback: API_V1_ROLLBACK_ROUTE,
+              restart: API_V1_RESTART_ROUTE,
+            },
+          })
+        },
+      })
+
+      const stopV1Updates = webServer.register({
+        kind: 'exact',
+        path: API_V1_UPDATES_ROUTE,
+        handler: async (req, res) => {
+          const query = new URL(req.url ?? '', 'http://localhost').searchParams
+          if (req.method === 'GET') {
+            const name = query.get('package') ?? ''
+            if (!PACKAGE_RE.test(name)) {
+              json(res, 400, { schema: UPDATE_API_V1_SCHEMA, error: 'a valid package name is required' })
+              return
+            }
+            const profileDir = resolveProfileDir(config)
+            const item = readInstalled(profileDir).find((entry) => entry.name === name)
+            if (item === undefined || item.source !== 'npm' || item.version === null) {
+              json(res, 404, { schema: UPDATE_API_V1_SCHEMA, error: 'plugin is not installed (or not an npm package)' })
+              return
+            }
+            const latest = await npmLatestVersion(name)
+            json(res, 200, {
+              schema: UPDATE_API_V1_SCHEMA,
+              package: {
+                name,
+                source: 'npm',
+                installedVersion: item.version,
+                latestVersion: latest,
+                updateAvailable: latest !== null && latest !== item.version,
+              },
+            })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { schema: UPDATE_API_V1_SCHEMA, error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { schema: UPDATE_API_V1_SCHEMA, error: 'untrusted origin' })
+            return
+          }
+          let body: { packageName?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { schema: UPDATE_API_V1_SCHEMA, error: 'invalid JSON body' })
+            return
+          }
+          const name = typeof body.packageName === 'string' ? body.packageName : ''
+          if (!PACKAGE_RE.test(name)) {
+            json(res, 400, { schema: UPDATE_API_V1_SCHEMA, error: 'a valid package name is required' })
+            return
+          }
+          const agentsBlocked = mutatingBlock(ctx)
+          if (agentsBlocked !== null) {
+            json(res, 409, {
+              schema: UPDATE_API_V1_SCHEMA,
+              error: agentsBlocked.error,
+              failure: { code: 'AGENTS_RUNNING', message: agentsBlocked.error, retryable: true },
+            })
+            return
+          }
+          if (installing || operationsV1.hasActive()) {
+            json(res, 409, {
+              schema: UPDATE_API_V1_SCHEMA,
+              error: 'another update operation is already running',
+              failure: { code: 'OPERATION_BUSY', message: 'another update operation is already running', retryable: true },
+            })
+            return
+          }
+          const profileDir = resolveProfileDir(config)
+          const before = installedVersionOf(profileDir, name)
+          if (before === null) {
+            json(res, 404, {
+              schema: UPDATE_API_V1_SCHEMA,
+              error: 'plugin is not installed',
+              failure: { code: 'PLUGIN_NOT_INSTALLED', message: 'plugin is not installed in this profile', retryable: false },
+            })
+            return
+          }
+          installing = true
+          const snapshotId = snapshotCreate(profileDir, `before v1 update ${name}`)
+          const operation = operationsV1.create(name, before, snapshotId)
+          operationsV1.start(operation.operationId)
+          json(res, 202, { schema: UPDATE_API_V1_SCHEMA, operation: operationsV1.get(operation.operationId) })
+          void runDshPlugin(profileName(config), ['add', `${name}@latest`]).then((outcome) => {
+            const after = installedVersionOf(profileDir, name)
+            operationsV1.finish(
+              operation.operationId,
+              outcome.ok,
+              outcome.ok ? null : { error: outcome.output, timedOut: outcome.timedOut },
+              after,
+              outcome.ok && after !== before,
+            )
+            logEvent(outcome.ok ? 'info' : 'warn', 'api-v1', `update ${name}: ${outcome.ok ? `ok (${after ?? '?'})` : 'failed'}`)
+          }).catch((error) => {
+            operationsV1.finish(operation.operationId, false, { error: String(error instanceof Error ? error.message : error) }, null, false)
+          }).finally(() => {
+            installing = false
+          })
+        },
+      })
+
+      const stopV1Operations = webServer.register({
+        kind: 'exact',
+        path: API_V1_OPERATIONS_ROUTE,
+        handler: (req, res) => {
+          if (req.method !== 'GET') {
+            json(res, 405, { schema: UPDATE_API_V1_SCHEMA, error: 'method not allowed' })
+            return
+          }
+          const id = new URL(req.url ?? '', 'http://localhost').searchParams.get('id') ?? ''
+          const operation = operationsV1.get(id)
+          if (operation === null) {
+            json(res, 404, { schema: UPDATE_API_V1_SCHEMA, error: 'operation not found in this host process' })
+            return
+          }
+          json(res, 200, { schema: UPDATE_API_V1_SCHEMA, operation })
+        },
+      })
+
+      const stopV1Rollback = webServer.register({
+        kind: 'exact',
+        path: API_V1_ROLLBACK_ROUTE,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            json(res, 405, { schema: UPDATE_API_V1_SCHEMA, error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { schema: UPDATE_API_V1_SCHEMA, error: 'untrusted origin' })
+            return
+          }
+          let body: { operationId?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { schema: UPDATE_API_V1_SCHEMA, error: 'invalid JSON body' })
+            return
+          }
+          const operationId = typeof body.operationId === 'string' ? body.operationId : ''
+          const snapshotId = operationsV1.beginRollback(operationId)
+          if (snapshotId === null) {
+            json(res, 409, { schema: UPDATE_API_V1_SCHEMA, error: 'rollback is not available for this operation' })
+            return
+          }
+          const profileDir = resolveProfileDir(config)
+          const result = snapshotRestore(profileDir, snapshotId)
+          const operation = operationsV1.finishRollback(
+            operationId,
+            result.ok,
+            result.error ?? null,
+            result.ok ? installedVersionOf(profileDir, operationsV1.get(operationId)?.packageName ?? '') : undefined,
+          )
+          logEvent(result.ok ? 'info' : 'warn', 'api-v1', `rollback ${operationId}: ${result.ok ? 'ok' : result.error}`)
+          json(res, result.ok ? 200 : 400, { schema: UPDATE_API_V1_SCHEMA, operation })
+        },
+      })
+
+      const stopV1Restart = webServer.register({
+        kind: 'exact',
+        path: API_V1_RESTART_ROUTE,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            json(res, 405, { schema: UPDATE_API_V1_SCHEMA, error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { schema: UPDATE_API_V1_SCHEMA, error: 'untrusted origin' })
+            return
+          }
+          // Reply FIRST: the restart kills this process the moment it runs.
+          json(res, 200, { schema: UPDATE_API_V1_SCHEMA, ok: true })
+          try {
+            triggerRestart(resolveProfileDir(config))
+          } catch (error) {
+            logEvent('error', 'api-v1', `restart failed: ${String(error instanceof Error ? error.message : error)}`)
+          }
+        },
+      })
+
       const stopSnapshots = webServer.register({
         kind: 'exact',
         path: SNAPSHOTS_ROUTE,
@@ -1683,6 +1917,11 @@ export function mountRoutes(ctx: {
         stopOrder()
         stopBackup()
         stopSync()
+        stopV1Capabilities()
+        stopV1Updates()
+        stopV1Operations()
+        stopV1Rollback()
+        stopV1Restart()
         stopSnapshots()
         stopRestoreSnapshot()
         stopStatus()
