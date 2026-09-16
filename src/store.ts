@@ -22,6 +22,8 @@ export interface MpState {
   favorites: string[]
   /** Per-plugin notes (plan #21, v1 local): slug → free-form text. */
   notes: Record<string, string>
+  /** Active theme (plan #23): remembered so switching can auto-disable it. */
+  theme: { slug: string; name: string } | null
 }
 
 const MAX_NOTES = 200
@@ -39,6 +41,15 @@ function sanitizeNotes(value: unknown): Record<string, string> {
   return out
 }
 
+function sanitizeTheme(value: unknown): { slug: string; name: string } | null {
+  if (typeof value !== 'object' || value === null) return null
+  const rec = value as Record<string, unknown>
+  if (typeof rec.slug !== 'string' || rec.slug === '' || typeof rec.name !== 'string' || rec.name === '') {
+    return null
+  }
+  return { slug: rec.slug, name: rec.name }
+}
+
 function defaults(): MpState {
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -46,6 +57,7 @@ function defaults(): MpState {
     agentTools: true,
     favorites: [],
     notes: {},
+    theme: null,
   }
 }
 
@@ -73,6 +85,7 @@ export function loadMpState(dir: string): MpState {
             .slice(0, 500)
         : [],
       notes: sanitizeNotes(parsed.notes),
+      theme: sanitizeTheme(parsed.theme),
     }
   } catch {
     return fallback

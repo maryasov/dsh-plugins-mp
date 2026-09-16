@@ -168,6 +168,8 @@ interface InstallResult {
   ignoredBuilds?: string[]
   verified?: boolean | null
   installedName?: string | null
+  hot?: boolean
+  hotReason?: string
 }
 
 interface InstalledItem {
@@ -321,6 +323,12 @@ const UI = {
     noteSave: 'Save note',
     noteSaved: 'Saved',
     changelog: 'Release notes',
+    themeApply: 'Apply',
+    themeActive: 'Active theme',
+    themeEnable: 'Enable',
+    themeDeactivate: 'Deactivate',
+    themeBusy: 'Applying…',
+    themeFail: 'Failed to apply',
   },
   zh: {
     title: '插件市场',
@@ -402,6 +410,12 @@ const UI = {
     noteSave: '保存笔记',
     noteSaved: '已保存',
     changelog: '发布说明',
+    themeApply: '应用',
+    themeActive: '当前主题',
+    themeEnable: '启用',
+    themeDeactivate: '停用',
+    themeBusy: '应用中…',
+    themeFail: '应用失败',
   },
   ru: {
     title: 'Маркетплейс',
@@ -483,6 +497,12 @@ const UI = {
     noteSave: 'Сохранить заметку',
     noteSaved: 'Сохранено',
     changelog: 'Что нового',
+    themeApply: 'Применить',
+    themeActive: 'Активная тема',
+    themeEnable: 'Включить',
+    themeDeactivate: 'Отключить',
+    themeBusy: 'Применяю…',
+    themeFail: 'Не удалось применить',
   },
 } as const
 
@@ -2138,8 +2158,160 @@ function useRestartFlow(): { pending: boolean; restarting: boolean; arm: () => v
   return { pending, restarting, arm }
 }
 
-const COMING_TABS = ['themes'] as const
-type ShellTab = 'catalog' | 'mine' | 'favorites' | 'diagnostics' | (typeof COMING_TABS)[number] | 'settings'
+type ShellTab = 'catalog' | 'mine' | 'favorites' | 'themes' | 'diagnostics' | 'settings'
+
+/**
+ * Themes tab (plan #23): the catalog's "themes" category with exclusive
+ * live switching on top of the phase-2 machinery. Applying a theme disables
+ * the previously active one (toggle route, HMR ~1s), installs/enables the
+ * chosen one if needed (install route hot-mounts), and remembers the choice
+ * in state.json via /theme. Status badges are derived from the real
+ * installed+enabled state, never from the persisted preference alone.
+ */
+function ThemesView(props: { onNeedsRestart?: () => void } = {}) {
+  const t = uiLang()
+  const [items, setItems] = useState<MpCard[] | null>(null)
+  const [installed, setInstalled] = useState<InstalledItem[]>([])
+  const [active, setActive] = useState<{ slug: string; name: string } | null>(null)
+  const [busySlug, setBusySlug] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [slug, setSlug] = useState<string | null>(null)
+
+  const reload = (): void => {
+    const usp = new URLSearchParams({ category: 'themes', installable: '1', sort: 'stars', limit: '100' })
+    usp.set('locale', langCode())
+    api<{ items: MpCard[] }>(`/plugins?${usp.toString()}`)
+      .then((d) => setItems(d.items))
+      .catch(() => setItems([]))
+    fetchInstalled().then(setInstalled).catch(() => setInstalled([]))
+    fetch('/plugins/dsh-plugins-mp/theme', { headers: { accept: 'application/json' } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { active?: { slug: string; name: string } | null } | null) => setActive(d?.active ?? null))
+      .catch(() => {})
+  }
+  useEffect(reload, [])
+
+  if (slug !== null) {
+    return (
+      <DetailView slug={slug} dshVersion={null} onBack={() => setSlug(null)} onOpenSlug={setSlug} />
+    )
+  }
+
+  const post = (path: string, body: unknown): Promise<Record<string, unknown>> =>
+    fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(async (r) => {
+      const body = (await r.json().catch(() => ({}))) as Record<string, unknown>
+      if (!r.ok) throw new Error(String(body.error ?? r.status))
+      return body
+    })
+
+  const applyTheme = async (c: MpCard): Promise<void> => {
+    setErr(null)
+    setBusySlug(c.slug)
+    try {
+      // Взаимоисключающее переключение: гасим прежнюю тему, если она ещё включена.
+      if (active !== null && active.slug !== c.slug) {
+        const prev = installed.find((i) => i.name === active.name)
+        if (prev !== undefined && prev.disabled !== true) {
+          await post('/plugins/dsh-plugins-mp/toggle', { name: active.name, disable: true })
+        }
+      }
+      let name = c.npmPackage ?? ''
+      let hot = true
+      const inst = installed.find((i) => i.name === name)
+      if (inst === undefined) {
+        const r = await requestInstall(c.slug, 'web')
+        if (!r.ok) throw new Error(r.error ?? 'install failed')
+        name = r.installedName ?? name
+        hot = r.hot !== false
+      } else {
+        name = inst.name
+        if (inst.disabled === true) {
+          await post('/plugins/dsh-plugins-mp/toggle', { name, disable: false })
+        }
+      }
+      if (name === '') throw new Error('cannot resolve the theme package name')
+      await post('/plugins/dsh-plugins-mp/theme', { slug: c.slug, name })
+      setActive({ slug: c.slug, name })
+      setInstalled(await fetchInstalled())
+      if (!hot) props.onNeedsRestart?.()
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e))
+    } finally {
+      setBusySlug(null)
+    }
+  }
+
+  const deactivate = async (): Promise<void> => {
+    if (active === null) return
+    setBusySlug(active.slug)
+    try {
+      const inst = installed.find((i) => i.name === active.name)
+      if (inst !== undefined && inst.disabled !== true) {
+        await post('/plugins/dsh-plugins-mp/toggle', { name: active.name, disable: true })
+      }
+      await post('/plugins/dsh-plugins-mp/theme', { slug: null })
+      setActive(null)
+      setInstalled(await fetchInstalled())
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e))
+    } finally {
+      setBusySlug(null)
+    }
+  }
+
+  return (
+    <div style={S.list}>
+      {err !== null && <div style={{ ...S.err, margin: '6px 12px' }}>{t.themeFail}: {err}</div>}
+      {items === null ? (
+        <div style={S.placeholder}>{t.loading}</div>
+      ) : items.length === 0 ? (
+        <div style={S.placeholder}>{t.empty}</div>
+      ) : (
+        <div style={{ ...S.grid, paddingTop: 8 }}>
+          {items.map((c) => {
+            const isActive = active?.slug === c.slug
+            const name = c.npmPackage ?? ''
+            const inst = installed.find((i) => i.name === name)
+            const busy = busySlug === c.slug
+            return (
+              <div key={c.slug} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <Card card={c} dshVersion={null} onOpen={() => setSlug(c.slug)} />
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  {isActive ? (
+                    <>
+                      <span style={{ ...S.badge, ...S.chipOn }}>{t.themeActive}</span>
+                      <button
+                        type="button"
+                        style={{ ...S.installBtn, marginLeft: 'auto' }}
+                        disabled={busy}
+                        onClick={() => { void deactivate() }}
+                      >
+                        {busy ? t.themeBusy : t.themeDeactivate}
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      style={S.installBtn}
+                      disabled={busy || busySlug !== null}
+                      onClick={() => { void applyTheme(c) }}
+                    >
+                      {busy ? t.themeBusy : inst !== undefined && inst.disabled !== true ? t.themeApply : inst !== undefined ? t.themeEnable : t.themeApply}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
 
 /**
  * Favorites tab (plan 3.2): cards for the slugs persisted in the host's
@@ -2258,15 +2430,13 @@ function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
       {tab === 'catalog' ? <CatalogView {...props} /> : null}
       {tab === 'mine' ? <InstalledView onNeedsRestart={armRestart} /> : null}
       {tab === 'favorites' ? <FavoritesView /> : null}
+      {tab === 'themes' ? <ThemesView onNeedsRestart={armRestart} /> : null}
       {tab === 'settings' ? (
         <SettingsView>
           <PnpmHealthRow />
         </SettingsView>
       ) : null}
       {tab === 'diagnostics' ? <DiagnosticsView /> : null}
-      {COMING_TABS.includes(tab as (typeof COMING_TABS)[number]) ? (
-        <div style={S.placeholder}>{t.comingSoon}</div>
-      ) : null}
     </div>
   )
 

@@ -44,6 +44,7 @@ export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
 export const SETTINGS_ROUTE = '/plugins/dsh-plugins-mp/settings'
 export const FAVORITE_ROUTE = '/plugins/dsh-plugins-mp/favorite'
 export const NOTE_ROUTE = '/plugins/dsh-plugins-mp/note'
+export const THEME_ROUTE = '/plugins/dsh-plugins-mp/theme'
 export const LOGS_ROUTE = '/plugins/dsh-plugins-mp/logs'
 export const INSTALLED_ROUTE = '/plugins/dsh-plugins-mp/installed'
 export const UNINSTALL_ROUTE = '/plugins/dsh-plugins-mp/uninstall'
@@ -360,11 +361,24 @@ export function mountRoutes(ctx: {
   const apiBase = resolveApiBase(config)
   let installing = false
 
-  const resolveCommand = async (slug: string, profile: string): Promise<{ command: string; source: string } | null> => {
+  const resolveCommand = async (
+    slug: string,
+    profile: string,
+  ): Promise<{ command: string; source: string; fallback: string | null } | null> => {
     try {
       const detail = await fetchDetail(apiBase, slug, AbortSignal.timeout(15_000))
       const source = installSourceFor(detail.plugin)
-      return { command: `dsh plugin --profile ${profile} add ${source}`, source }
+      // Данные каталога бывают протухшими (npmPackage отсутствует в registry) —
+      // держим github-источник как запасной для ретрая.
+      const fallback =
+        detail.plugin.repoOwner && detail.plugin.repoName
+          ? `github:${detail.plugin.repoOwner}/${detail.plugin.repoName}`
+          : null
+      return {
+        command: `dsh plugin --profile ${profile} add ${source}`,
+        source,
+        fallback: fallback !== null && fallback !== source ? fallback : null,
+      }
     } catch {
       return null
     }
@@ -452,7 +466,17 @@ export function mountRoutes(ctx: {
             const profileDir = resolveProfileDir({ profile })
             const before = new Set(readInstalled(profileDir).map((item) => item.name))
             snapshotCreate(profileDir, `before install ${resolved.source}`)
-            const outcome = await runDshPluginAdd(profile, resolved.source)
+            let outcome = await runDshPluginAdd(profile, resolved.source)
+            if (!outcome.ok && resolved.fallback !== null) {
+              // npm-источник не поднялся (404/недоступен) — второй заход через github.
+              logEvent('info', 'install', `${resolved.source} failed — retrying via ${resolved.fallback}`)
+              const retried = await runDshPluginAdd(profile, resolved.fallback)
+              if (retried.ok) {
+                outcome = retried
+              } else {
+                outcome.output = `${outcome.output}\n— retry via ${resolved.fallback} also failed (code ${retried.code}${retried.timedOut ? ', timed out' : ''})`
+              }
+            }
             if (outcome.ok) {
               // Verified install = a (new) dependency whose manifest is on
               // disk. For github sources the true name only shows up in the
@@ -611,6 +635,54 @@ export function mountRoutes(ctx: {
           runtime.updateState({ notes })
           logEvent('info', 'note', `${text === '' ? '-' : '+'} ${slug}`)
           json(res, 200, { notes })
+        },
+      })
+
+      // Themes (plan #23): remember which theme plugin is active so the
+      // client's switch flow can auto-disable it. GET → { active }, POST
+      // { slug, name } sets one, POST { slug: null } clears.
+      const stopTheme = webServer.register({
+        kind: 'exact',
+        path: THEME_ROUTE,
+        handler: async (req, res) => {
+          if (req.method === 'GET') {
+            json(res, 200, { active: runtime?.getState().theme ?? null })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          if (runtime === undefined) {
+            json(res, 503, { error: 'runtime is not available' })
+            return
+          }
+          let body: { slug?: unknown; name?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          if (body.slug === null) {
+            runtime.updateState({ theme: null })
+            json(res, 200, { active: null })
+            return
+          }
+          const slug = typeof body.slug === 'string' ? body.slug : ''
+          const name = typeof body.name === 'string' ? body.name : ''
+          if (!SLUG_RE.test(slug) || !SLUG_RE.test(name)) {
+            json(res, 400, { error: 'invalid slug or name' })
+            return
+          }
+          const theme = { slug, name }
+          runtime.updateState({ theme })
+          logEvent('info', 'theme', `active: ${slug} (${name})`)
+          json(res, 200, { active: theme })
         },
       })
 
@@ -1053,6 +1125,7 @@ export function mountRoutes(ctx: {
         stopSettings()
         stopFavorite()
         stopNote()
+        stopTheme()
         stopLogs()
         stopInstalled()
         stopUninstall()
