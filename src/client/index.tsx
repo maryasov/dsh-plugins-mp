@@ -13,6 +13,7 @@
  * without better-sidebar.
  */
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { ReactNode } from 'react'
 import { BrandMark } from './brand'
 
@@ -146,6 +147,47 @@ interface InstallResult {
   code: number | null
   timedOut: boolean
   error?: string
+  ignoredBuilds?: string[]
+  verified?: boolean | null
+  installedName?: string | null
+}
+
+interface InstalledItem {
+  name: string
+  spec: string
+  source: 'npm' | 'github' | 'git' | 'link' | 'file'
+  version: string | null
+  description: string | null
+  hasClient: boolean
+  updateAvailable?: boolean
+  latest?: string | null
+}
+
+async function fetchInstalled(): Promise<InstalledItem[]> {
+  const res = await fetch('/plugins/dsh-plugins-mp/installed', { headers: { accept: 'application/json' } })
+  if (!res.ok) throw new Error(String(res.status))
+  const body = (await res.json()) as { items?: InstalledItem[] }
+  return body.items ?? []
+}
+
+async function fetchUpdates(): Promise<Record<string, { latest: string | null; updateAvailable: boolean }>> {
+  try {
+    const res = await fetch('/plugins/dsh-plugins-mp/update', { headers: { accept: 'application/json' } })
+    if (!res.ok) return {}
+    const body = (await res.json()) as { items?: Array<{ name: string; latest: string | null; updateAvailable: boolean }> }
+    return Object.fromEntries((body.items ?? []).map((item) => [item.name, { latest: item.latest, updateAvailable: item.updateAvailable }]))
+  } catch {
+    return {}
+  }
+}
+
+async function pluginAction(route: string, body: Record<string, unknown>): Promise<{ ok?: boolean; output?: string; error?: string }> {
+  const res = await fetch(route, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return (await res.json().catch(() => ({}))) as { ok?: boolean; output?: string; error?: string }
 }
 
 async function requestInstall(slug: string, profile: string): Promise<InstallResult> {
@@ -210,6 +252,19 @@ const UI = {
     download: 'Download',
     installStats: 'Install statistics',
     installStatsSoon: 'planned',
+    mineEmpty: 'Nothing installed yet.',
+    uninstall: 'Uninstall',
+    confirmUninstall: 'Remove?',
+    update: 'Update',
+    pnpmRow: 'pnpm (package manager)',
+    pnpmMissing: 'not found — needed to install plugins',
+    setup: 'Install',
+    allowBuilds: 'Allow build scripts',
+    allowBuildsHint: 'pnpm blocked the build scripts of:',
+    installedUnverified: 'installed (unverified)',
+    fullscreen: 'Full screen',
+    exitFullscreen: 'Exit full screen',
+    myPlugins: 'Installed in this profile',
   },
   zh: {
     title: '插件市场',
@@ -257,6 +312,19 @@ const UI = {
     download: '下载',
     installStats: '安装统计',
     installStatsSoon: '计划中',
+    mineEmpty: '还没有安装任何插件。',
+    uninstall: '卸载',
+    confirmUninstall: '确认删除？',
+    update: '更新',
+    pnpmRow: 'pnpm（包管理器）',
+    pnpmMissing: '未找到 — 安装插件需要它',
+    setup: '安装',
+    allowBuilds: '允许构建脚本',
+    allowBuildsHint: 'pnpm 阻止了以下包的构建脚本：',
+    installedUnverified: '已安装（未验证）',
+    fullscreen: '全屏',
+    exitFullscreen: '退出全屏',
+    myPlugins: '已安装到此配置',
   },
   ru: {
     title: 'Маркетплейс',
@@ -304,6 +372,19 @@ const UI = {
     download: 'Скачать',
     installStats: 'Статистика установок',
     installStatsSoon: 'планируется',
+    mineEmpty: 'Пока ничего не установлено.',
+    uninstall: 'Удалить',
+    confirmUninstall: 'Удалить?',
+    update: 'Обновить',
+    pnpmRow: 'pnpm (пакетный менеджер)',
+    pnpmMissing: 'не найден — нужен для установки плагинов',
+    setup: 'Установить',
+    allowBuilds: 'Разрешить сборку',
+    allowBuildsHint: 'pnpm заблокировал build-скрипты:',
+    installedUnverified: 'установлено (без проверки)',
+    fullscreen: 'Во весь экран',
+    exitFullscreen: 'Выйти из полного экрана',
+    myPlugins: 'Установлено в этом профиле',
   },
 } as const
 
@@ -738,6 +819,7 @@ type InstallState =
   | { phase: 'idle' }
   | { phase: 'busy' }
   | { phase: 'done' }
+  | { phase: 'blocked' }
   | { phase: 'error'; message: string; output: string }
 
 function InstallButton(props: {
@@ -747,13 +829,40 @@ function InstallButton(props: {
 }) {
   const t = uiLang()
   const [state, setState] = useState<InstallState>({ phase: 'idle' })
+  const [blocked, setBlocked] = useState<string[]>([])
+  const [verified, setVerified] = useState<boolean | null>(null)
   const profile = props.profile ?? 'web'
   const start = () => {
     if (state.phase === 'busy') return
     setState({ phase: 'busy' })
+    setBlocked([])
     requestInstall(props.slug, profile)
       .then((r) => {
         if (r.ok) {
+          // pnpm ≥10 silently skips dependency build scripts until allowed:
+          // surface the names and let one click allowlist + retry.
+          if (r.ignoredBuilds !== undefined && r.ignoredBuilds.length > 0) {
+            setBlocked(r.ignoredBuilds)
+            setState({ phase: 'blocked' })
+            return
+          }
+          setVerified(r.verified ?? null)
+          setState({ phase: 'done' })
+        } else {
+          setState({ phase: 'error', message: r.error ?? `exit ${String(r.code)}`, output: r.output })
+        }
+      })
+      .catch((e) => setState({ phase: 'error', message: String(e), output: '' }))
+  }
+  const allowAndRetry = () => {
+    if (blocked.length === 0) return
+    setState({ phase: 'busy' })
+    pluginAction('/plugins/dsh-plugins-mp/approve-builds', { packages: blocked, profile })
+      .then(() => requestInstall(props.slug, profile))
+      .then((r) => {
+        if (r.ok) {
+          setBlocked([])
+          setVerified(r.verified ?? null)
           setState({ phase: 'done' })
         } else {
           setState({ phase: 'error', message: r.error ?? `exit ${String(r.code)}`, output: r.output })
@@ -763,9 +872,10 @@ function InstallButton(props: {
   }
   const label =
     state.phase === 'busy' ? t.installing
-      : state.phase === 'done' ? `✓ ${t.installed}`
-        : state.phase === 'error' ? t.installFailed
-          : t.install
+      : state.phase === 'done' ? (verified === false ? `✓ ${t.installedUnverified}` : `✓ ${t.installed}`)
+        : state.phase === 'blocked' ? t.allowBuilds
+          : state.phase === 'error' ? t.installFailed
+            : t.install
   if (props.compact) {
     return (
       <button
@@ -776,7 +886,8 @@ function InstallButton(props: {
         }}
         onClick={(e) => {
           e.stopPropagation()
-          start()
+          if (state.phase === 'blocked') allowAndRetry()
+          else start()
         }}
         disabled={state.phase === 'busy'}
         title={state.phase === 'error' ? state.message : undefined}
@@ -787,9 +898,18 @@ function InstallButton(props: {
   }
   return (
     <span>
-      <button style={S.bigInstall} onClick={start} disabled={state.phase === 'busy'}>
+      <button
+        style={{ ...S.bigInstall, ...(state.phase === 'blocked' ? BADGE_TONE.unknown : {}) }}
+        onClick={state.phase === 'blocked' ? allowAndRetry : start}
+        disabled={state.phase === 'busy'}
+      >
         {label}
       </button>
+      {state.phase === 'blocked' && (
+        <div style={{ marginTop: 8 }}>
+          <div style={S.hint}>{t.allowBuildsHint} {blocked.join(', ')}</div>
+        </div>
+      )}
       {state.phase === 'error' && (
         <div style={{ marginTop: 8 }}>
           <div style={S.err}>{state.message}</div>
@@ -1319,8 +1439,8 @@ Object.assign(S, {
   link: { color: 'inherit', fontSize: 12, textDecoration: 'underline', cursor: 'pointer' },
 })
 
-/** Settings tab: the agent-tools switch, log export, and planned rows. */
-function SettingsView() {
+/** Settings tab: the agent-tools switch, pnpm health, log export, planned rows. */
+function SettingsView(props: { children?: ReactNode } = {}) {
   const uiLangCode = useUiLang()
   const t = UI[uiLangCode] as UiDict
   const [agentTools, setAgentTools] = useState<boolean | null>(null)
@@ -1378,6 +1498,7 @@ function SettingsView() {
         </div>
         <a style={S.link} href={LOGS_ROUTE} download="dsh-plugins-mp.log">{t.download}</a>
       </div>
+      {props.children}
       <div style={{ ...S.settingsRow, opacity: 0.55 }}>
         <div style={S.settingsText}>
           <div style={S.settingsName}>{t.installStats}</div>
@@ -1388,18 +1509,178 @@ function SettingsView() {
   )
 }
 
-const COMING_TABS = ['mine', 'favorites', 'themes', 'diagnostics'] as const
-type ShellTab = 'catalog' | (typeof COMING_TABS)[number] | 'settings'
+/** One installed-plugin row: identity, source badge, update + uninstall actions. */
+function InstalledRow(props: {
+  item: InstalledItem
+  onChange: () => void
+}) {
+  const t = uiLang()
+  const { item } = props
+  const [confirming, setConfirming] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const act = (route: string, body: Record<string, unknown>): void => {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    pluginAction(route, body)
+      .then((res) => {
+        if (res.error !== undefined) setError(res.error)
+        else props.onChange()
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => { setBusy(false); setConfirming(false) })
+  }
+
+  return (
+    <div style={{ ...S.settingsRow, flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', width: '100%' }}>
+        <span style={{ ...S.badge, flexShrink: 0 }}>{item.source}</span>
+        <span style={S.cardName}>{item.name}</span>
+        {item.version !== null ? <code style={{ ...S.code, fontSize: 11 }}>{item.version}</code> : null}
+        {item.updateAvailable === true && item.latest != null ? (
+          <span style={{ ...S.badge, ...BADGE_TONE.unknown }}>→ {item.latest}</span>
+        ) : null}
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, flexShrink: 0 }}>
+          {item.source === 'npm' && item.updateAvailable === true ? (
+            <button
+              type="button"
+              style={S.installBtn}
+              disabled={busy}
+              onClick={() => act('/plugins/dsh-plugins-mp/update', { name: item.name })}
+            >
+              {t.update}
+            </button>
+          ) : null}
+          {confirming ? (
+            <button
+              type="button"
+              style={{ ...S.installBtn, ...BADGE_TONE.failed }}
+              disabled={busy}
+              onClick={() => act('/plugins/dsh-plugins-mp/uninstall', { name: item.name })}
+            >
+              {busy ? '…' : t.confirmUninstall}
+            </button>
+          ) : (
+            <button
+              type="button"
+              style={S.installBtn}
+              disabled={busy}
+              onClick={() => setConfirming(true)}
+            >
+              {t.uninstall}
+            </button>
+          )}
+        </span>
+      </div>
+      {item.description !== null ? <div style={S.hint}>{item.description}</div> : null}
+      {error !== null ? <div style={{ ...S.hint, color: '#e5484d' }}>{error}</div> : null}
+    </div>
+  )
+}
+
+/** The "My plugins" tab: live inventory of the running profile. */
+function InstalledView() {
+  const t = uiLang()
+  const [items, setItems] = useState<InstalledItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [query, setQuery] = useState('')
+
+  const reload = (): void => {
+    fetchInstalled()
+      .then(async (list) => {
+        const updates = await fetchUpdates()
+        setItems(list.map((item) => ({ ...item, ...(updates[item.name] ?? {}) })))
+      })
+      .catch((e) => setError(String(e)))
+  }
+  useEffect(reload, [])
+
+  if (error !== null) return <div style={S.placeholder}>{error}</div>
+  if (items === null) return <div style={S.placeholder}>{t.loading}</div>
+  const filtered = query.trim() === ''
+    ? items
+    : items.filter((item) => item.name.toLowerCase().includes(query.trim().toLowerCase()))
+  return (
+    <div style={S.settings}>
+      <div style={S.hint}>{t.myPlugins} ({items.length})</div>
+      <input
+        style={S.search}
+        placeholder={t.search}
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+      />
+      {filtered.length === 0 ? <div style={S.placeholder}>{t.mineEmpty}</div> : null}
+      {filtered.map((item) => (
+        <InstalledRow key={item.name} item={item} onChange={reload} />
+      ))}
+    </div>
+  )
+}
+
+/** pnpm presence row for the Settings tab (helper #9). */
+function PnpmHealthRow() {
+  const t = uiLang()
+  const [health, setHealth] = useState<{ found: boolean; version: string | null } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const reload = (): void => {
+    fetch('/plugins/dsh-plugins-mp/health', { headers: { accept: 'application/json' } })
+      .then((res) => res.json())
+      .then((body: { pnpm?: { found: boolean; version: string | null } }) =>
+        setHealth(body.pnpm ?? { found: false, version: null }))
+      .catch(() => setHealth({ found: false, version: null }))
+  }
+  useEffect(reload, [])
+  const setup = (): void => {
+    setBusy(true)
+    pluginAction('/plugins/dsh-plugins-mp/setup-pnpm', {})
+      .finally(() => { setBusy(false); reload() })
+  }
+  return (
+    <div style={S.settingsRow}>
+      <div style={S.settingsText}>
+        <div style={S.settingsName}>{t.pnpmRow}</div>
+        <div style={S.hint}>
+          {health === null ? t.loading : health.found ? `v${health.version ?? '?'}` : t.pnpmMissing}
+        </div>
+      </div>
+      {health !== null && !health.found ? (
+        <button type="button" style={S.toggle} disabled={busy} onClick={setup}>
+          {busy ? '…' : t.setup}
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
+const COMING_TABS = ['favorites', 'themes', 'diagnostics'] as const
+type ShellTab = 'catalog' | 'mine' | (typeof COMING_TABS)[number] | 'settings'
 
 /**
  * The market shell: one tabbed surface shared by the better-sidebar tab and
- * the DSH settings section. Only Catalog and Settings carry content so far;
+ * the DSH settings section. Catalog / My plugins / Settings carry content;
  * the rest show "coming soon" placeholders until their phases land.
+ *
+ * In the settings surface the dialog is a fixed 800px column (no host
+ * affordance to widen it), so the ⤢ button portals the shell into a
+ * full-viewport layer above the dialog; Esc or the same button returns.
  */
-function MarketShell(props: MpTabProps) {
+function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
   const uiLangCode = useUiLang()
   const t = UI[uiLangCode] as UiDict
   const [tab, setTab] = useState<ShellTab>('catalog')
+  const [fullscreen, setFullscreen] = useState(false)
+  const surface = props.surface ?? 'sidebar'
+
+  useEffect(() => {
+    if (!fullscreen) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setFullscreen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [fullscreen])
 
   const tabs: Array<{ id: ShellTab; label: string }> = [
     { id: 'catalog', label: t.title },
@@ -1410,8 +1691,8 @@ function MarketShell(props: MpTabProps) {
     { id: 'settings', label: t.tabSettings },
   ]
 
-  return (
-    <div style={S.root}>
+  const body = (
+    <div style={{ ...S.root, ...(fullscreen ? { height: '100vh' } : {}) }} data-fullscreen={fullscreen || undefined}>
       <div style={S.tabbar}>
         {tabs.map((entry) => (
           <button
@@ -1423,14 +1704,48 @@ function MarketShell(props: MpTabProps) {
             {entry.label}
           </button>
         ))}
+        {surface === 'settings' ? (
+          <button
+            type="button"
+            style={{ ...S.tab, marginLeft: 'auto' }}
+            title={fullscreen ? t.exitFullscreen : t.fullscreen}
+            onClick={() => setFullscreen((v) => !v)}
+          >
+            {fullscreen ? '⤡' : '⤢'}
+          </button>
+        ) : null}
       </div>
       {tab === 'catalog' ? <CatalogView {...props} /> : null}
-      {tab === 'settings' ? <SettingsView /> : null}
+      {tab === 'mine' ? <InstalledView /> : null}
+      {tab === 'settings' ? (
+        <SettingsView>
+          <PnpmHealthRow />
+        </SettingsView>
+      ) : null}
       {COMING_TABS.includes(tab as (typeof COMING_TABS)[number]) ? (
         <div style={S.placeholder}>{t.comingSoon}</div>
       ) : null}
     </div>
   )
+
+  if (fullscreen) {
+    const target = document.querySelector('[role="dialog"]') ?? document.body
+    return createPortal(
+      <div
+        style={{
+          position: 'fixed',
+          inset: 0,
+          zIndex: 99999,
+          background: 'var(--dsw-alias-bg-layer-1, #16171a)',
+          color: 'inherit',
+        }}
+      >
+        {body}
+      </div>,
+      target,
+    )
+  }
+  return body
 }
 
 // ---------------------------------------------------------------- apply
@@ -1482,7 +1797,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context): void {
     const off = slots.inject('settings.section', () =>
       slots.register(
         { name: 'settings.section', id: 'dsh-plugins-mp', order: 46, label: () => uiLang().title },
-        () => <MarketShell visible scope={{ sessionId: 'settings' }} />,
+        () => <MarketShell visible scope={{ sessionId: 'settings' }} surface="settings" />,
       ),
     )
     if (typeof off === 'function') {

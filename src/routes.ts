@@ -22,13 +22,29 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { CONFIG_ROUTE, fetchDetail, installSourceFor, resolveApiBase, type MpApiConfig } from './api.js'
 import { dshHostInfo } from './host-info.js'
+import {
+  installedSpec,
+  installedVersion,
+  isPackageOnDisk,
+  npmLatestVersion,
+  parseIgnoredBuilds,
+  readInstalled,
+} from './installed.js'
 import { exportLog, logEvent } from './log.js'
+import { resolveProfileDir } from './mp-home.js'
 import type { MpRuntime } from './runtime.js'
+import { allowBuildsAdd } from './workspace-yaml.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
 export const SETTINGS_ROUTE = '/plugins/dsh-plugins-mp/settings'
 export const LOGS_ROUTE = '/plugins/dsh-plugins-mp/logs'
+export const INSTALLED_ROUTE = '/plugins/dsh-plugins-mp/installed'
+export const UNINSTALL_ROUTE = '/plugins/dsh-plugins-mp/uninstall'
+export const UPDATE_ROUTE = '/plugins/dsh-plugins-mp/update'
+export const APPROVE_BUILDS_ROUTE = '/plugins/dsh-plugins-mp/approve-builds'
+export const HEALTH_ROUTE = '/plugins/dsh-plugins-mp/health'
+export const SETUP_PNPM_ROUTE = '/plugins/dsh-plugins-mp/setup-pnpm'
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000
 const MAX_OUTPUT_CHARS = 20_000
@@ -78,6 +94,7 @@ export function requestAllowed(req: NodeReq): boolean {
 }
 
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/
+const PACKAGE_RE = /^(@[a-z0-9-]+\/)?[a-z0-9][a-z0-9._-]{0,119}$/
 const PROFILE_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/
 
 function readBody(req: NodeReq): Promise<string> {
@@ -99,6 +116,12 @@ export interface InstallOutcome {
   source: string
   output: string
   timedOut: boolean
+  /** Package names pnpm blocked build scripts for during this run. */
+  ignoredBuilds?: string[]
+  /** Post-install verification: the package is materialized in the profile. */
+  verified?: boolean | null
+  /** The dependency name the install added, when it could be determined. */
+  installedName?: string | null
 }
 
 /**
@@ -160,12 +183,18 @@ function spawnEnv(): NodeJS.ProcessEnv {
   }
 }
 
-export function runDshPluginAdd(
+/**
+ * One `dsh plugin --profile <profile> <args…>` invocation — the shared
+ * executor behind install, uninstall and update. The CLI forwards the args
+ * to pnpm in the profile directory and reconciles its bundle list.
+ */
+export function runDshPlugin(
   profile: string,
-  source: string,
+  pnpmArgs: readonly string[],
   timeoutMs = INSTALL_TIMEOUT_MS,
 ): Promise<InstallOutcome> {
-  const command = `dsh plugin --profile ${profile} add ${source}`
+  const command = `dsh plugin --profile ${profile} ${pnpmArgs.join(' ')}`
+  const source = pnpmArgs[pnpmArgs.length - 1] ?? ''
   const commands = dshCommands()
   const env = spawnEnv()
   return new Promise((resolve) => {
@@ -190,7 +219,7 @@ export function runDshPluginAdd(
       }
       const cmd = commands[index]
       let timer: ReturnType<typeof setTimeout> | undefined
-      const child = spawn(cmd.argv[0], [...cmd.argv.slice(1), 'plugin', '--profile', profile, 'add', source], {
+      const child = spawn(cmd.argv[0], [...cmd.argv.slice(1), 'plugin', '--profile', profile, ...pnpmArgs], {
         cwd: cmd.cwd,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -214,16 +243,102 @@ export function runDshPluginAdd(
       }, timeoutMs)
       child.on('close', (code) => {
         if (timer) clearTimeout(timer)
-        resolve({ ok: code === 0 && !timedOut, code, command, source, output: output.trim(), timedOut })
+        const trimmed = output.trim()
+        resolve({
+          ok: code === 0 && !timedOut,
+          code,
+          command,
+          source,
+          output: trimmed,
+          timedOut,
+          ignoredBuilds: parseIgnoredBuilds(trimmed),
+        })
       })
     }
     attempt(0)
   })
 }
 
+/** Install one marketplace source into a profile. */
+export function runDshPluginAdd(
+  profile: string,
+  source: string,
+  timeoutMs = INSTALL_TIMEOUT_MS,
+): Promise<InstallOutcome> {
+  return runDshPlugin(profile, ['add', source], timeoutMs)
+}
+
+/** Run plain `pnpm <args>` in the profile directory with the repaired env. */
+export function runPnpm(
+  profileDir: string,
+  args: readonly string[],
+  timeoutMs = INSTALL_TIMEOUT_MS,
+): Promise<{ ok: boolean; output: string }> {
+  const env = spawnEnv()
+  return new Promise((resolve) => {
+    let output = ''
+    const collect = (buf: Buffer): void => {
+      output += buf.toString('utf8')
+      if (output.length > MAX_OUTPUT_CHARS) output = output.slice(-MAX_OUTPUT_CHARS)
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const child = spawn('pnpm', [...args], { cwd: profileDir, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    child.stdout?.on('data', collect)
+    child.stderr?.on('data', collect)
+    child.on('error', (error) => {
+      if (timer) clearTimeout(timer)
+      resolve({ ok: false, output: `${output}\n${String(error)}`.trim() })
+    })
+    timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      resolve({ ok: false, output: `${output}\ntimed out`.trim() })
+    }, timeoutMs)
+    child.on('close', (code) => {
+      if (timer) clearTimeout(timer)
+      resolve({ ok: code === 0, output: output.trim() })
+    })
+  })
+}
+
+/** The names of currently running host agents, for the mutation guard. */
+function runningAgentIdsOf(ctx: { get?: (name: string) => unknown }): string[] {
+  try {
+    const service = ctx.get?.('agents') as { list?: () => unknown } | undefined
+    const listed = service?.list?.()
+    if (!Array.isArray(listed)) return []
+    const ids: string[] = []
+    for (const agent of listed) {
+      if (agent === null || typeof agent !== 'object') continue
+      const record = agent as { id?: unknown; status?: unknown }
+      if (record.status !== 'running') continue
+      ids.push(typeof record.id === 'string' && record.id !== '' ? record.id : 'agent')
+    }
+    return ids
+  } catch {
+    // A half-disposed registry must never take the routes down (fail open).
+    return []
+  }
+}
+
+/**
+ * The mutation guard: installing or removing packages swaps files a live
+ * agent may still be reading or lazily importing. Returns the 409 body when
+ * an agent is mid-turn, null when mutations may proceed.
+ */
+function mutatingBlock(ctx: { get?: (name: string) => unknown }): { error: string; agents: string[] } | null {
+  const agents = runningAgentIdsOf(ctx)
+  if (agents.length === 0) return null
+  return {
+    error: `an agent session is running (${agents.join(', ')}) — plugin changes are paused until it finishes`,
+    agents,
+  }
+}
+
 export function mountRoutes(ctx: {
   inject: (deps: string[], fn: (sctx: never) => unknown) => unknown
-}, config: MpApiConfig = {}, runtime?: MpRuntime): void {
+  /** Cordis context read (agents inventory) when the host exposes it. */
+  get?: (name: string) => unknown
+}, config: MpApiConfig & { profile?: string } = {}, runtime?: MpRuntime): void {
   const apiBase = resolveApiBase(config)
   let installing = false
 
@@ -302,15 +417,32 @@ export function mountRoutes(ctx: {
             json(res, 200, { ok: true, ...resolved, dry: true, output: '', code: null, timedOut: false })
             return
           }
+          const blocked = mutatingBlock(ctx)
+          if (blocked !== null) {
+            json(res, 409, blocked)
+            return
+          }
           if (installing) {
             json(res, 409, { error: 'another install is already in progress' })
             return
           }
           installing = true
           try {
+            const profileDir = resolveProfileDir({ profile })
+            const before = new Set(readInstalled(profileDir).map((item) => item.name))
             const outcome = await runDshPluginAdd(profile, resolved.source)
+            if (outcome.ok) {
+              // Verified install = a (new) dependency whose manifest is on
+              // disk. For github sources the true name only shows up in the
+              // dependency diff; unresolvable keeps verified null.
+              const added = readInstalled(profileDir).map((item) => item.name).filter((name) => !before.has(name))
+              const isPlainSpec = /^[a-z0-9][a-z0-9._/-]*(@[^\s]+)?$/i.test(resolved.source)
+              const installedName = added[0] ?? (isPlainSpec ? resolved.source.replace(/@[^\s/@]+$/, '') : null)
+              outcome.installedName = installedName
+              outcome.verified = installedName === null ? null : isPackageOnDisk(profileDir, installedName)
+            }
             logEvent(outcome.ok ? 'info' : 'warn', 'install',
-              `${resolved.source} → profile ${profile}: ${outcome.ok ? 'ok' : `failed (code ${outcome.code}${outcome.timedOut ? ', timed out' : ''})`}`)
+              `${resolved.source} → profile ${profile}: ${outcome.ok ? `ok${outcome.ignoredBuilds?.length ? `, blocked builds: ${outcome.ignoredBuilds.join(', ')}` : ''}` : `failed (code ${outcome.code}${outcome.timedOut ? ', timed out' : ''})`}`)
             json(res, 200, outcome)
           } catch (error) {
             logEvent('error', 'install', String(error instanceof Error ? error.message : error))
@@ -367,12 +499,246 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // ------------------------------------------------------------------
+      // Installed-plugins surface (My plugins tab).
+      // ------------------------------------------------------------------
+
+      const stopInstalled = webServer.register({
+        kind: 'exact',
+        path: INSTALLED_ROUTE,
+        handler: (_req, res) => {
+          json(res, 200, { dsh: dshHostInfo(), items: readInstalled(resolveProfileDir(config)) })
+        },
+      })
+
+      const stopUninstall = webServer.register({
+        kind: 'exact',
+        path: UNINSTALL_ROUTE,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          let body: { name?: unknown; profile?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const name = typeof body.name === 'string' ? body.name : ''
+          const profile = typeof body.profile === 'string' && body.profile !== '' ? body.profile : 'web'
+          if (!PACKAGE_RE.test(name)) {
+            json(res, 400, { error: 'invalid package name' })
+            return
+          }
+          const blocked = mutatingBlock(ctx)
+          if (blocked !== null) {
+            json(res, 409, blocked)
+            return
+          }
+          if (installing) {
+            json(res, 409, { error: 'another install is already in progress' })
+            return
+          }
+          installing = true
+          try {
+            const outcome = await runDshPlugin(profile, ['remove', name])
+            logEvent(outcome.ok ? 'info' : 'warn', 'uninstall',
+              `${name} from profile ${profile}: ${outcome.ok ? 'removed' : `failed (code ${outcome.code})`}`)
+            json(res, 200, outcome)
+          } finally {
+            installing = false
+          }
+        },
+      })
+
+      const stopUpdate = webServer.register({
+        kind: 'exact',
+        path: UPDATE_ROUTE,
+        handler: async (req, res) => {
+          if (req.method === 'GET') {
+            // Update scan: npm-installed packages only — link:/file:/github
+            // sources have no registry truth to compare against.
+            const profileDir = resolveProfileDir(config)
+            const scan = await Promise.all(
+              readInstalled(profileDir)
+                .filter((item) => item.source === 'npm' && item.version !== null)
+                .map(async (item) => ({
+                  name: item.name,
+                  current: item.version,
+                  latest: await npmLatestVersion(item.name),
+                }))
+                .map(async (entry) => {
+                  const e = await entry
+                  return { ...e, updateAvailable: e.latest !== null && e.current !== null && e.latest !== e.current }
+                }),
+            )
+            json(res, 200, { items: scan })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          let body: { name?: unknown; profile?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const name = typeof body.name === 'string' ? body.name : ''
+          const profile = typeof body.profile === 'string' && body.profile !== '' ? body.profile : 'web'
+          if (!PACKAGE_RE.test(name)) {
+            json(res, 400, { error: 'invalid package name' })
+            return
+          }
+          const blocked = mutatingBlock(ctx)
+          if (blocked !== null) {
+            json(res, 409, blocked)
+            return
+          }
+          if (installing) {
+            json(res, 409, { error: 'another install is already in progress' })
+            return
+          }
+          installing = true
+          try {
+            const outcome = await runDshPlugin(profile, ['add', `${name}@latest`])
+            logEvent(outcome.ok ? 'info' : 'warn', 'update',
+              `${name} in profile ${profile}: ${outcome.ok ? 'updated' : `failed (code ${outcome.code})`}`)
+            json(res, 200, outcome)
+          } finally {
+            installing = false
+          }
+        },
+      })
+
+      const stopApproveBuilds = webServer.register({
+        kind: 'exact',
+        path: APPROVE_BUILDS_ROUTE,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          let body: { packages?: unknown; profile?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const profile = typeof body.profile === 'string' && body.profile !== '' ? body.profile : 'web'
+          const packages = Array.isArray(body.packages)
+            ? body.packages.filter((item): item is string => typeof item === 'string' && PACKAGE_RE.test(item))
+            : []
+          if (packages.length === 0) {
+            json(res, 400, { error: 'packages must be a non-empty array of package names' })
+            return
+          }
+          try {
+            const { added, file } = allowBuildsAdd(resolveProfileDir({ profile }), packages)
+            logEvent('info', 'approve-builds', `allowed build scripts: ${added.join(', ')} (${file})`)
+            json(res, 200, { ok: true, added, file })
+          } catch (error) {
+            json(res, 500, { error: String(error instanceof Error ? error.message : error) })
+          }
+        },
+      })
+
+      const stopHealth = webServer.register({
+        kind: 'exact',
+        path: HEALTH_ROUTE,
+        handler: (_req, res) => {
+          let settled = false
+          const done = (body: unknown): void => {
+            if (settled) return
+            settled = true
+            json(res, 200, body)
+          }
+          const child = spawn('pnpm', ['--version'], { env: spawnEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+          let version = ''
+          child.stdout?.on('data', (chunk: Buffer) => { version += chunk.toString('utf8') })
+          child.on('error', () => done({ pnpm: { found: false }, dsh: dshCommands()[0]?.label ?? null }))
+          const timer = setTimeout(() => { child.kill('SIGKILL'); done({ pnpm: { found: false }, dsh: dshCommands()[0]?.label ?? null }) }, 15_000)
+          child.on('close', (code) => {
+            clearTimeout(timer)
+            done({
+              pnpm: { found: code === 0, version: version.trim() || null },
+              dsh: dshCommands()[0]?.label ?? null,
+            })
+          })
+        },
+      })
+
+      const stopSetupPnpm = webServer.register({
+        kind: 'exact',
+        path: SETUP_PNPM_ROUTE,
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          // Global npm install — cwd-independent; npm must already exist
+          // (it ships with the Node that runs DSH itself).
+          const outcome = await new Promise<{ ok: boolean; output: string }>((resolve) => {
+            let output = ''
+            const collect = (buf: Buffer): void => {
+              output += buf.toString('utf8')
+              if (output.length > MAX_OUTPUT_CHARS) output = output.slice(-MAX_OUTPUT_CHARS)
+            }
+            const child = spawn('npm', ['install', '-g', 'pnpm@11'], { env: spawnEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+            let timer: ReturnType<typeof setTimeout> | undefined
+            child.stdout?.on('data', collect)
+            child.stderr?.on('data', collect)
+            child.on('error', (error) => {
+              if (timer) clearTimeout(timer)
+              resolve({ ok: false, output: `${output}\n${String(error)}`.trim() })
+            })
+            timer = setTimeout(() => {
+              child.kill('SIGKILL')
+              resolve({ ok: false, output: `${output}\ntimed out`.trim() })
+            }, INSTALL_TIMEOUT_MS)
+            child.on('close', (code) => {
+              if (timer) clearTimeout(timer)
+              resolve({ ok: code === 0, output: output.trim() })
+            })
+          })
+          logEvent(outcome.ok ? 'info' : 'warn', 'setup-pnpm', outcome.ok ? 'pnpm installed globally' : `failed: ${outcome.output.slice(-200)}`)
+          json(res, 200, outcome)
+        },
+      })
+
       return () => {
         stopHost()
         stopConfig()
         stopInstall()
         stopSettings()
         stopLogs()
+        stopInstalled()
+        stopUninstall()
+        stopUpdate()
+        stopApproveBuilds()
+        stopHealth()
+        stopSetupPnpm()
       }
     }, 'dsh-plugins-mp: host routes')
   })

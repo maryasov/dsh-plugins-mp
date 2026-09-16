@@ -43,6 +43,8 @@ export interface MpContext {
   }
   /** Dynamic injection (core cordis) — used for the web-profile-only HTTP surface. */
   inject: (deps: string[], fn: (sctx: never) => unknown) => unknown
+  /** Cordis service read — the agents inventory guard (optional). */
+  get?: (name: string) => unknown
 }
 
 /** Value object: any JSON shape we return (checked per-field at runtime by the registry). */
