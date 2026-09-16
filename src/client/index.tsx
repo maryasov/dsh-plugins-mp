@@ -101,6 +101,9 @@ interface MpCard {
   originalLang?: string
   /** Original short text not yet translated into the UI locale (badge pulses). */
   shortPending?: boolean
+  /** First README screenshot — theme-card cover. */
+  cover?: string | null
+  shots?: number
   npmPackage: string | null
   repoOwner: string | null
   repoName: string | null
@@ -2170,6 +2173,7 @@ type ShellTab = 'catalog' | 'mine' | 'favorites' | 'themes' | 'diagnostics' | 's
  */
 function ThemesView(props: { onNeedsRestart?: () => void } = {}) {
   const t = uiLang()
+  const favorites = useFavorites()
   const [items, setItems] = useState<MpCard[] | null>(null)
   const [installed, setInstalled] = useState<InstalledItem[]>([])
   const [active, setActive] = useState<{ slug: string; name: string } | null>(null)
@@ -2271,38 +2275,77 @@ function ThemesView(props: { onNeedsRestart?: () => void } = {}) {
       ) : items.length === 0 ? (
         <div style={S.placeholder}>{t.empty}</div>
       ) : (
-        <div style={{ ...S.grid, paddingTop: 8 }}>
+        <div style={{ ...S.grid, gridAutoRows: 'min-content', alignItems: 'start', paddingTop: 8 }}>
           {items.map((c) => {
             const isActive = active?.slug === c.slug
             const name = c.npmPackage ?? ''
             const inst = installed.find((i) => i.name === name)
             const busy = busySlug === c.slug
             return (
-              <div key={c.slug} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                <Card card={c} dshVersion={null} onOpen={() => setSlug(c.slug)} />
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                  {isActive ? (
-                    <>
-                      <span style={{ ...S.badge, ...S.chipOn }}>{t.themeActive}</span>
-                      <button
-                        type="button"
-                        style={{ ...S.installBtn, marginLeft: 'auto' }}
-                        disabled={busy}
-                        onClick={() => { void deactivate() }}
-                      >
-                        {busy ? t.themeBusy : t.themeDeactivate}
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      style={S.installBtn}
-                      disabled={busy || busySlug !== null}
-                      onClick={() => { void applyTheme(c) }}
-                    >
-                      {busy ? t.themeBusy : inst !== undefined && inst.disabled !== true ? t.themeApply : inst !== undefined ? t.themeEnable : t.themeApply}
-                    </button>
+              <div
+                key={c.slug}
+                className="dsh-mp-theme-card"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  borderRadius: 10,
+                  border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.28))',
+                  background: 'var(--dsw-alias-bg-layer-1, rgba(128,128,128,0.06))',
+                  overflow: 'hidden',
+                }}
+              >
+                {c.cover != null ? (
+                  <button
+                    type="button"
+                    className="dsh-mp-theme-cover"
+                    title={t.screenshots}
+                    onClick={() => setSlug(c.slug)}
+                  >
+                    <img src={c.cover} alt="" loading="lazy" onError={(e) => { e.currentTarget.style.display = 'none' }} />
+                    {(c.shots ?? 0) > 1 && <span className="dsh-mp-theme-pill">{c.shots}</span>}
+                  </button>
+                ) : (
+                  <div className="dsh-mp-theme-cover dsh-mp-theme-cover-empty">
+                    <span>✦</span>
+                    <span>{t.screenshots}</span>
+                  </div>
+                )}
+                <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 }}>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <span style={{ ...S.cardName, cursor: 'pointer' }} onClick={() => setSlug(c.slug)}>{c.displayName}</span>
+                    <span style={S.cardStars}>★ {c.stars}</span>
+                  </div>
+                  {c.authorName !== null && <span style={{ ...S.muted, fontSize: 11 }}>{t.by}: {c.authorName}</span>}
+                  {c.shortDescription !== null && c.shortDescription !== '' && (
+                    <span style={S.desc}>{c.shortDescription}</span>
                   )}
+                </div>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '8px 12px', borderTop: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.22))' }}>
+                  <span
+                    role="button"
+                    style={{ ...S.favBtn, ...(favorites.includes(c.slug) ? S.favOn : {}) }}
+                    title={favorites.includes(c.slug) ? t.favRemove : t.favAdd}
+                    onClick={() => toggleFavorite(c.slug)}
+                  >
+                    ♥
+                  </span>
+                  {isActive && <span style={{ ...S.badge, ...S.chipOn }}>{t.themeActive}</span>}
+                  <button
+                    type="button"
+                    style={{ ...S.installBtn, marginLeft: 'auto' }}
+                    disabled={busy || (!isActive && busySlug !== null)}
+                    onClick={() => { if (isActive) { void deactivate() } else { void applyTheme(c) } }}
+                  >
+                    {busy
+                      ? t.themeBusy
+                      : isActive
+                        ? t.themeDeactivate
+                        : inst !== undefined && inst.disabled !== true
+                          ? t.themeApply
+                          : inst !== undefined
+                            ? t.themeEnable
+                            : t.themeApply}
+                  </button>
                 </div>
               </div>
             )
