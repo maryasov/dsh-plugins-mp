@@ -49,6 +49,16 @@ import {
   writeFileAtomic,
   type OrderConflict,
 } from './order.js'
+import {
+  createProfileBackup,
+  MAX_BACKUP_BYTES,
+  mergeRestoreManifest,
+  mergeRestoreState,
+  restoreProfileBackup,
+  stateFileForBackup,
+  unportableDeps,
+  validatedBackup,
+} from './backup.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
@@ -66,6 +76,7 @@ export const SETUP_PNPM_ROUTE = '/plugins/dsh-plugins-mp/setup-pnpm'
 export const TOGGLE_ROUTE = '/plugins/dsh-plugins-mp/toggle'
 export const GROUP_ROUTE = '/plugins/dsh-plugins-mp/group'
 export const ORDER_ROUTE = '/plugins/dsh-plugins-mp/order'
+export const BACKUP_ROUTE = '/plugins/dsh-plugins-mp/backup'
 export const SNAPSHOTS_ROUTE = '/plugins/dsh-plugins-mp/snapshots'
 export const RESTORE_SNAPSHOT_ROUTE = '/plugins/dsh-plugins-mp/restore-snapshot'
 export const STATUS_ROUTE = '/plugins/dsh-plugins-mp/status'
@@ -123,12 +134,14 @@ const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/
 const PACKAGE_RE = /^(@[a-z0-9-]+\/)?[a-z0-9][a-z0-9._-]{0,119}$/
 const PROFILE_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/
 
-function readBody(req: NodeReq): Promise<string> {
+function readBody(req: NodeReq, maxBytes = 10_000): Promise<string> {
   return new Promise((resolve) => {
     let body = ''
+    let bytes = 0
     req.on('data', (chunk: Buffer) => {
+      bytes += chunk.length
       body += chunk.toString('utf8')
-      if (body.length > 10_000) body = ''
+      if (bytes > maxBytes) body = ''
     })
     req.on('end', () => resolve(body))
     req.on('close', () => resolve(body))
@@ -1308,6 +1321,97 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // Backup/restore (plan #11): config-only portable JSON, format-
+      // compatible with dsh-market. GET downloads; POST merges (current deps
+      // stay, backup specs win, bundles union, state.json merges field-wise
+      // with the current fingerprint kept) with automatic rollback on error.
+      const stopBackup = webServer.register({
+        kind: 'exact',
+        path: BACKUP_ROUTE,
+        handler: async (req, res) => {
+          const profileDir = resolveProfileDir(config)
+          if (req.method === 'GET') {
+            // The download exposes the whole config surface — same-origin only.
+            if (!requestAllowed(req)) {
+              json(res, 403, { error: 'forbidden' })
+              return
+            }
+            try {
+              const backup = createProfileBackup(profileDir, profileName(config))
+              res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'content-disposition': `attachment; filename="dsh-mp-backup-${new Date().toISOString().slice(0, 10)}.json"`,
+              })
+              res.end(JSON.stringify(backup, null, 2))
+            } catch (error) {
+              json(res, 500, { error: String(error instanceof Error ? error.message : error) })
+            }
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          let backup
+          try {
+            const raw = await readBody(req, MAX_BACKUP_BYTES + 100_000)
+            backup = validatedBackup(JSON.parse(raw || 'null'))
+          } catch (error) {
+            json(res, 400, { error: String(error instanceof Error ? error.message : error) })
+            return
+          }
+          // package.json writes race installs — same mutex.
+          if (installing) {
+            json(res, 409, { error: 'another install is already in progress' })
+            return
+          }
+          installing = true
+          try {
+            const manifestPath = join(profileDir, 'package.json')
+            const currentManifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+            const backupManifest = backup.files.find((file) => file.path === 'package.json')
+            if (backupManifest === undefined || !('json' in backupManifest)) {
+              json(res, 400, { error: 'backup has no package.json' })
+              return
+            }
+            const mergedManifest = mergeRestoreManifest(backupManifest.json, currentManifest)
+
+            // state.json merges field-wise; the current fingerprint never travels.
+            const stateEntry = backup.files.find((file) => file.path === '.dsh-mp/state.json')
+            const mergedState = mergeRestoreState(stateFileForBackup(profileDir), stateEntry !== undefined ? (stateEntry as { lines: string[] }).lines.join('\n') : null)
+            const files = backup.files.map((file) =>
+              file.path === '.dsh-mp/state.json' ? { path: file.path, lines: mergedState.split('\n') } : file,
+            )
+
+            const backupDeps = backupManifest.json.dependencies !== null && typeof backupManifest.json.dependencies === 'object'
+              ? backupManifest.json.dependencies as Record<string, unknown>
+              : {}
+            const currentDeps = currentManifest.dependencies !== null && typeof currentManifest.dependencies === 'object'
+              ? currentManifest.dependencies as Record<string, unknown>
+              : {}
+            const depsAdded = Object.keys(backupDeps).filter((name) => !(name in currentDeps))
+
+            const result = restoreProfileBackup(profileDir, { ...backup, files }, mergedManifest)
+            logEvent('info', 'backup', `restored ${result.files} files from backup (${backup.createdAt})`)
+            json(res, 200, {
+              ok: true,
+              files: result.files,
+              depsAdded,
+              unportable: unportableDeps(mergedManifest.dependencies),
+              restartNeeded: true,
+            })
+          } catch (error) {
+            json(res, 400, { error: String(error instanceof Error ? error.message : error) })
+          } finally {
+            installing = false
+          }
+        },
+      })
+
       const stopSnapshots = webServer.register({
         kind: 'exact',
         path: SNAPSHOTS_ROUTE,
@@ -1434,6 +1538,7 @@ export function mountRoutes(ctx: {
         stopToggle()
         stopGroup()
         stopOrder()
+        stopBackup()
         stopSnapshots()
         stopRestoreSnapshot()
         stopStatus()

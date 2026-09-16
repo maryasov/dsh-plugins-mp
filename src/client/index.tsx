@@ -239,13 +239,13 @@ async function fetchUpdates(): Promise<Record<string, { latest: string | null; u
   }
 }
 
-async function pluginAction(route: string, body: Record<string, unknown>): Promise<{ ok?: boolean; output?: string; error?: string; restartNeeded?: boolean; moved?: number; conflicts?: Array<{ name: string; reason: string }> }> {
+async function pluginAction(route: string, body: Record<string, unknown>): Promise<{ ok?: boolean; output?: string; error?: string; restartNeeded?: boolean; moved?: number; files?: number; depsAdded?: string[]; conflicts?: Array<{ name: string; reason: string }> }> {
   const res = await fetch(route, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
-  return (await res.json().catch(() => ({}))) as { ok?: boolean; output?: string; error?: string; restartNeeded?: boolean; moved?: number; conflicts?: Array<{ name: string; reason: string }> }
+  return (await res.json().catch(() => ({}))) as { ok?: boolean; output?: string; error?: string; restartNeeded?: boolean; moved?: number; files?: number; depsAdded?: string[]; conflicts?: Array<{ name: string; reason: string }> }
 }
 
 async function requestInstall(slug: string, profile: string): Promise<InstallResult> {
@@ -348,6 +348,16 @@ const UI = {
     orderTrialFailed: 'Trial composition failed — rolled back.',
     orderMoved: 'entries moved',
     orderEmpty: 'No reorderable bundles.',
+    backupTitle: 'Backup & restore',
+    backupHint: 'Config-only portable file: manifest, patch layer, groups, favorites, notes, load order. Never installed packages.',
+    backupWarn: 'The file may contain tokens or passwords from config files — do not share it.',
+    backupDownload: 'Download backup',
+    backupRestore: 'Restore from file…',
+    backupConfirm: 'Restore',
+    backupDone: 'Restored: {n} files. A restart applies the changes.',
+    backupMissing: 'not in this profile',
+    backupInvalid: 'Not a valid backup file.',
+    backupSummary: 'Backup from {date}: {files} files, {deps} plugins.',
     favAdd: 'Add to favorites',
     favRemove: 'Remove from favorites',
     favEmpty: 'Nothing here yet — tap ♥ on a card.',
@@ -451,6 +461,16 @@ const UI = {
     orderTrialFailed: '试组装失败 — 已回滚。',
     orderMoved: '个条目移动',
     orderEmpty: '无可排序捆绑包。',
+    backupTitle: '备份与恢复',
+    backupHint: '仅配置的便携文件：清单、补丁层、分组、收藏、笔记、加载顺序。不含已安装的包。',
+    backupWarn: '文件可能包含配置中的令牌或密码 — 请勿外传。',
+    backupDownload: '下载备份',
+    backupRestore: '从文件恢复…',
+    backupConfirm: '恢复',
+    backupDone: '已恢复 {n} 个文件。重启后生效。',
+    backupMissing: '本配置缺少',
+    backupInvalid: '不是有效的备份文件。',
+    backupSummary: '备份日期 {date}：{files} 个文件，{deps} 个插件。',
     favAdd: '加入收藏',
     favRemove: '取消收藏',
     favEmpty: '还没有收藏 — 点击卡片上的 ♥。',
@@ -554,6 +574,16 @@ const UI = {
     orderTrialFailed: 'Пробная сборка не прошла — порядок откачен.',
     orderMoved: 'записей переставлено',
     orderEmpty: 'Нет переставляемых бандлов.',
+    backupTitle: 'Резервная копия',
+    backupHint: 'Портативный файл только с настройками: манифест, патч-слой, группы, избранное, заметки, порядок загрузки. Без установленных пакетов.',
+    backupWarn: 'Файл может содержать токены и пароли из конфигов — не передавайте его третьим лицам.',
+    backupDownload: 'Скачать бэкап',
+    backupRestore: 'Восстановить из файла…',
+    backupConfirm: 'Восстановить',
+    backupDone: 'Восстановлено файлов: {n}. Для применения нужен перезапуск.',
+    backupMissing: 'нет в этом профиле',
+    backupInvalid: 'Это не файл резервной копии.',
+    backupSummary: 'Бэкап от {date}: {files} файлов, {deps} плагинов.',
     favAdd: 'В избранное',
     favRemove: 'Убрать из избранного',
     favEmpty: 'Пока пусто — нажмите ♥ на карточке.',
@@ -1933,7 +1963,120 @@ Object.assign(S, {
 })
 
 /** Settings tab: the agent-tools switch, pnpm health, log export, planned rows. */
-function SettingsView(props: { children?: ReactNode } = {}) {
+const BACKUP_ROUTE = '/plugins/dsh-plugins-mp/backup'
+
+interface BackupSummary {
+  createdAt: string
+  profile: string
+  files: number
+  deps: number
+}
+
+/** Parse a backup file locally — enough fields to confirm the restore. */
+function summarizeBackup(raw: string): BackupSummary | null {
+  try {
+    const parsed = JSON.parse(raw) as { format?: unknown; createdAt?: unknown; profile?: unknown; files?: unknown[] }
+    if (parsed.format !== 'dsh-profile-backup' || !Array.isArray(parsed.files)) return null
+    const manifest = parsed.files.find((f) => (f as { path?: unknown }).path === 'package.json') as { json?: { dependencies?: Record<string, unknown> } } | undefined
+    return {
+      createdAt: typeof parsed.createdAt === 'string' ? parsed.createdAt : '',
+      profile: typeof parsed.profile === 'string' ? parsed.profile : '',
+      files: parsed.files.length,
+      deps: Object.keys(manifest?.json?.dependencies ?? {}).length,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Backup/restore section on the Settings tab (plan #11). */
+function BackupSection(props: { onNeedsRestart?: () => void }) {
+  const t = UI[useUiLang()] as UiDict
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const [picked, setPicked] = useState<{ name: string; raw: string } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [done, setDone] = useState<string | null>(null)
+
+  const download = (): void => {
+    const a = document.createElement('a')
+    a.href = BACKUP_ROUTE
+    a.download = `dsh-mp-backup-${new Date().toISOString().slice(0, 10)}.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  }
+
+  const restore = (): void => {
+    if (picked === null || busy) return
+    setBusy(true)
+    setError(null)
+    setDone(null)
+    pluginAction(BACKUP_ROUTE, JSON.parse(picked.raw) as Record<string, unknown>)
+      .then((res) => {
+        if (res.error !== undefined) {
+          setError(res.error)
+          return
+        }
+        const missing = Array.isArray(res.depsAdded) && res.depsAdded.length > 0 ? ` (${t.backupMissing}: ${res.depsAdded.join(', ')})` : ''
+        setDone(`${t.backupDone.replace('{n}', String(res.files ?? 0))}${missing}`)
+        setPicked(null)
+        props.onNeedsRestart?.()
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <div style={{ ...S.settingsRow, flexDirection: 'column', gap: 6 }}>
+      <div style={S.settingsText}>
+        <div style={S.settingsName}>{t.backupTitle}</div>
+        <div style={S.hint}>{t.backupHint}</div>
+        <div style={{ ...S.hint, color: '#f5a623' }}>{t.backupWarn}</div>
+      </div>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+        <button type="button" style={{ ...S.installBtn, marginLeft: 0 }} onClick={download}>{t.backupDownload}</button>
+        <button type="button" style={S.installBtn} onClick={() => inputRef.current?.click()}>{t.backupRestore}</button>
+        {picked !== null && (
+          <button type="button" style={{ ...S.installBtn, ...BADGE_TONE.passed }} disabled={busy} onClick={restore}>
+            {busy ? '…' : `${t.backupConfirm} ${picked.name}`}
+          </button>
+        )}
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".json,application/json"
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            e.target.value = ''
+            if (file === undefined) return
+            void file.text().then((raw) => {
+              if (summarizeBackup(raw) === null) {
+                setError(t.backupInvalid)
+                setPicked(null)
+                return
+              }
+              setError(null)
+              setDone(null)
+              setPicked({ name: file.name, raw })
+            })
+          }}
+        />
+      </div>
+      {picked !== null && (() => {
+        const summary = summarizeBackup(picked.raw)
+        return summary !== null ? (
+          <div style={S.hint}>{t.backupSummary.replace('{files}', String(summary.files)).replace('{deps}', String(summary.deps)).replace('{date}', summary.createdAt.slice(0, 10))}</div>
+        ) : null
+      })()}
+      {done !== null ? <div style={{ ...S.hint, color: '#46a758' }}>{done}</div> : null}
+      {error !== null ? <div style={{ ...S.hint, color: '#e5484d' }}>{error}</div> : null}
+    </div>
+  )
+}
+
+function SettingsView(props: { children?: ReactNode; onNeedsRestart?: () => void } = {}) {
   const uiLangCode = useUiLang()
   const t = UI[uiLangCode] as UiDict
   const [agentTools, setAgentTools] = useState<boolean | null>(null)
@@ -1992,6 +2135,7 @@ function SettingsView(props: { children?: ReactNode } = {}) {
         <a style={S.link} href={LOGS_ROUTE} download="dsh-plugins-mp.log">{t.download}</a>
       </div>
       {props.children}
+      <BackupSection onNeedsRestart={props.onNeedsRestart} />
       <div style={{ ...S.settingsRow, opacity: 0.55 }}>
         <div style={S.settingsText}>
           <div style={S.settingsName}>{t.installStats}</div>
@@ -2858,7 +3002,7 @@ function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
       {tab === 'favorites' ? <FavoritesView /> : null}
       {tab === 'themes' ? <ThemesView onNeedsRestart={armRestart} /> : null}
       {tab === 'settings' ? (
-        <SettingsView>
+        <SettingsView onNeedsRestart={armRestart}>
           <PnpmHealthRow />
         </SettingsView>
       ) : null}
