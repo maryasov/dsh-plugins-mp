@@ -16,6 +16,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { ReactNode } from 'react'
 import { BrandMark } from './brand'
+import { installSettingsNavStyle, registerSettingsNavIcon } from './settings-nav-icon'
 
 interface MpTabProps {
   readonly visible: boolean
@@ -1979,5 +1980,13 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context): void {
     if (typeof off === 'function') {
       ctx.effect(() => off as () => void, 'dsh-plugins-mp: settings section')
     }
+    // DSH paints a generic gear on external sections (no icon field in the
+    // contract): mark our localized nav row and paint the marketplace glyph
+    // over it with a currentColor mask — same adaptation as better-sidebar.
+    ctx.effect(() => installSettingsNavStyle(), 'dsh-plugins-mp: settings nav style')
+    ctx.effect(
+      () => registerSettingsNavIcon(() => uiLang().title),
+      'dsh-plugins-mp: settings nav icon',
+    )
   })
 }
