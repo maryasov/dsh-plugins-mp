@@ -11,6 +11,10 @@
  *   `dsh plugin` CLI (child_process, NOT ctx.shell: the agent shell is a
  *   sandboxed executor that denies profile writes — same reasoning as
  *   dsh-market). One install at a time.
+ * - GET  /plugins/dsh-plugins-mp/settings → { agentTools }
+ * - POST /plugins/dsh-plugins-mp/settings → body { agentTools }: flips the
+ *   model-facing tools live through the runtime.
+ * - GET  /plugins/dsh-plugins-mp/logs → sanitized plain-text event log.
  */
 import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
@@ -18,9 +22,13 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { CONFIG_ROUTE, fetchDetail, installSourceFor, resolveApiBase, type MpApiConfig } from './api.js'
 import { dshHostInfo } from './host-info.js'
+import { exportLog, logEvent } from './log.js'
+import type { MpRuntime } from './runtime.js'
 
 export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
+export const SETTINGS_ROUTE = '/plugins/dsh-plugins-mp/settings'
+export const LOGS_ROUTE = '/plugins/dsh-plugins-mp/logs'
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000
 const MAX_OUTPUT_CHARS = 20_000
@@ -215,7 +223,7 @@ export function runDshPluginAdd(
 
 export function mountRoutes(ctx: {
   inject: (deps: string[], fn: (sctx: never) => unknown) => unknown
-}, config: MpApiConfig = {}): void {
+}, config: MpApiConfig = {}, runtime?: MpRuntime): void {
   const apiBase = resolveApiBase(config)
   let installing = false
 
@@ -301,10 +309,61 @@ export function mountRoutes(ctx: {
           installing = true
           try {
             const outcome = await runDshPluginAdd(profile, resolved.source)
+            logEvent(outcome.ok ? 'info' : 'warn', 'install',
+              `${resolved.source} → profile ${profile}: ${outcome.ok ? 'ok' : `failed (code ${outcome.code}${outcome.timedOut ? ', timed out' : ''})`}`)
             json(res, 200, outcome)
+          } catch (error) {
+            logEvent('error', 'install', String(error instanceof Error ? error.message : error))
+            json(res, 500, { error: String(error instanceof Error ? error.message : error) })
           } finally {
             installing = false
           }
+        },
+      })
+
+      const stopSettings = webServer.register({
+        kind: 'exact',
+        path: SETTINGS_ROUTE,
+        handler: async (req, res) => {
+          if (req.method === 'GET') {
+            json(res, 200, { agentTools: runtime?.agentToolsEnabled() ?? true })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          if (runtime === undefined) {
+            json(res, 503, { error: 'runtime is not available' })
+            return
+          }
+          let body: { agentTools?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          if (typeof body.agentTools !== 'boolean') {
+            json(res, 400, { error: 'agentTools must be a boolean' })
+            return
+          }
+          runtime.setAgentTools(body.agentTools)
+          logEvent('info', 'settings', `agent tools ${body.agentTools ? 'enabled' : 'disabled'}`)
+          json(res, 200, { agentTools: runtime.agentToolsEnabled() })
+        },
+      })
+
+      const stopLogs = webServer.register({
+        kind: 'exact',
+        path: LOGS_ROUTE,
+        handler: (_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end(exportLog())
         },
       })
 
@@ -312,6 +371,8 @@ export function mountRoutes(ctx: {
         stopHost()
         stopConfig()
         stopInstall()
+        stopSettings()
+        stopLogs()
       }
     }, 'dsh-plugins-mp: host routes')
   })

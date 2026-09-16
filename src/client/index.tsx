@@ -50,6 +50,8 @@ const API_BASE_DEFAULT = 'https://dsh-plugins-mp.com/api'
 const CONFIG_ROUTE = '/plugins/dsh-plugins-mp/config'
 const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
+const SETTINGS_ROUTE = '/plugins/dsh-plugins-mp/settings'
+const LOGS_ROUTE = '/plugins/dsh-plugins-mp/logs'
 
 // The client appends /plugins, /categories, … to the base, so it must carry the
 // /api segment the API server is reached under (dev.dsh-plugins-mp.com/api →
@@ -191,6 +193,23 @@ const UI = {
     sortName: 'Name',
     updated: 'Updated',
     versions: 'Versions',
+    tabMine: 'My plugins',
+    tabFavorites: 'Favorites',
+    tabThemes: 'Themes',
+    tabDiagnostics: 'Diagnostics',
+    tabSettings: 'Settings',
+    comingSoon: 'This section ships in an upcoming update.',
+    agentTools: 'Model tools (mp_search, mp_details…)',
+    agentToolsHint: 'Lets the model search and inspect the marketplace inside conversations. Turn off to keep the context lean.',
+    on: 'On',
+    off: 'Off',
+    saving: 'Saving…',
+    saveError: 'Failed to save',
+    eventLog: 'Event log',
+    eventLogHint: 'A sanitized log of what the plugin did — for bug reports. Nothing is sent anywhere.',
+    download: 'Download',
+    installStats: 'Install statistics',
+    installStatsSoon: 'planned',
   },
   zh: {
     title: '插件市场',
@@ -221,6 +240,23 @@ const UI = {
     sortName: '名称',
     updated: '更新于',
     versions: '版本',
+    tabMine: '我的插件',
+    tabFavorites: '收藏',
+    tabThemes: '主题',
+    tabDiagnostics: '诊断',
+    tabSettings: '设置',
+    comingSoon: '该分区将在后续更新中推出。',
+    agentTools: '模型工具（mp_search、mp_details…）',
+    agentToolsHint: '允许模型在对话中搜索和查看市场。关闭可保持上下文精简。',
+    on: '开',
+    off: '关',
+    saving: '保存中…',
+    saveError: '保存失败',
+    eventLog: '事件日志',
+    eventLogHint: '插件操作的脱敏日志 — 用于错误报告。不会发送到任何地方。',
+    download: '下载',
+    installStats: '安装统计',
+    installStatsSoon: '计划中',
   },
   ru: {
     title: 'Маркетплейс',
@@ -251,6 +287,23 @@ const UI = {
     sortName: 'По имени',
     updated: 'Обновлено',
     versions: 'Версии',
+    tabMine: 'Мои плагины',
+    tabFavorites: 'Избранное',
+    tabThemes: 'Темы',
+    tabDiagnostics: 'Диагностика',
+    tabSettings: 'Настройки',
+    comingSoon: 'Раздел появится в ближайшем обновлении.',
+    agentTools: 'Инструменты модели (mp_search, mp_details…)',
+    agentToolsHint: 'Позволяет модели искать и изучать маркетплейс в беседах. Отключите, чтобы не засорять контекст.',
+    on: 'Вкл',
+    off: 'Выкл',
+    saving: 'Сохранение…',
+    saveError: 'Не удалось сохранить',
+    eventLog: 'Журнал событий',
+    eventLogHint: 'Очищенный лог действий плагина — для отчётов об ошибках. Никуда не отправляется.',
+    download: 'Скачать',
+    installStats: 'Статистика установок',
+    installStatsSoon: 'планируется',
   },
 } as const
 
@@ -1211,7 +1264,182 @@ function DetailView(props: {
   )
 }
 
+// ------------------------------------------------------------ settings + shell
+
+Object.assign(S, {
+  tabbar: {
+    display: 'flex',
+    gap: 2,
+    padding: '0 10px',
+    borderBottom: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.28))',
+    overflowX: 'auto',
+    flexShrink: 0,
+  },
+  tab: {
+    appearance: 'none',
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    fontSize: 12,
+    padding: '7px 9px',
+    cursor: 'pointer',
+    opacity: 0.65,
+    borderBottom: '2px solid transparent',
+    whiteSpace: 'nowrap',
+  },
+  tabActive: { opacity: 1, fontWeight: 600, borderBottom: '2px solid var(--dsw-alias-accent, currentColor)' },
+  placeholder: { padding: '28px 14px', opacity: 0.6, textAlign: 'center' },
+  settings: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '14px 12px', display: 'flex', flexDirection: 'column', gap: 14 },
+  settingsRow: {
+    display: 'flex',
+    gap: 10,
+    alignItems: 'flex-start',
+    padding: '10px 12px',
+    borderRadius: 10,
+    border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.28))',
+    background: 'var(--dsw-alias-bg-base, rgba(128,128,128,0.06))',
+  },
+  settingsText: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+  settingsName: { fontWeight: 600 },
+  hint: { opacity: 0.65, fontSize: 12, lineHeight: 1.4 },
+  toggle: {
+    appearance: 'none',
+    flexShrink: 0,
+    font: 'inherit',
+    fontSize: 12,
+    padding: '4px 12px',
+    borderRadius: 999,
+    cursor: 'pointer',
+    border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.35))',
+    background: 'transparent',
+    color: 'inherit',
+  },
+  toggleOn: { background: 'var(--dsw-alias-accent-soft, rgba(77,107,254,0.25))', borderColor: 'var(--dsw-alias-accent, #4d6bfe)' },
+  link: { color: 'inherit', fontSize: 12, textDecoration: 'underline', cursor: 'pointer' },
+})
+
+/** Settings tab: the agent-tools switch, log export, and planned rows. */
+function SettingsView() {
+  const uiLangCode = useUiLang()
+  const t = UI[uiLangCode] as UiDict
+  const [agentTools, setAgentTools] = useState<boolean | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    fetch(SETTINGS_ROUTE, { headers: { accept: 'application/json' } })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
+      .then((body: { agentTools?: boolean }) => { if (alive) setAgentTools(body.agentTools !== false) })
+      .catch(() => { if (alive) setAgentTools(true) })
+    return () => { alive = false }
+  }, [])
+
+  const flip = (): void => {
+    if (agentTools === null || busy) return
+    setBusy(true)
+    setError(false)
+    fetch(SETTINGS_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agentTools: !agentTools }),
+    })
+      .then(async (res) => {
+        const body = (await res.json().catch(() => ({}))) as { agentTools?: boolean }
+        if (!res.ok || typeof body.agentTools !== 'boolean') throw new Error(String(res.status))
+        setAgentTools(body.agentTools)
+      })
+      .catch(() => setError(true))
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <div style={S.settings}>
+      <div style={S.settingsRow}>
+        <div style={S.settingsText}>
+          <div style={S.settingsName}>{t.agentTools}</div>
+          <div style={S.hint}>{t.agentToolsHint}</div>
+          {error ? <div style={{ ...S.hint, color: '#e5484d' }}>{t.saveError}</div> : null}
+        </div>
+        <button
+          type="button"
+          style={{ ...S.toggle, ...(agentTools ? S.toggleOn : {}) }}
+          disabled={agentTools === null || busy}
+          onClick={flip}
+        >
+          {agentTools === null ? t.loading : busy ? t.saving : agentTools ? t.on : t.off}
+        </button>
+      </div>
+      <div style={S.settingsRow}>
+        <div style={S.settingsText}>
+          <div style={S.settingsName}>{t.eventLog}</div>
+          <div style={S.hint}>{t.eventLogHint}</div>
+        </div>
+        <a style={S.link} href={LOGS_ROUTE} download="dsh-plugins-mp.log">{t.download}</a>
+      </div>
+      <div style={{ ...S.settingsRow, opacity: 0.55 }}>
+        <div style={S.settingsText}>
+          <div style={S.settingsName}>{t.installStats}</div>
+          <div style={S.hint}>{t.installStatsSoon}</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const COMING_TABS = ['mine', 'favorites', 'themes', 'diagnostics'] as const
+type ShellTab = 'catalog' | (typeof COMING_TABS)[number] | 'settings'
+
+/**
+ * The market shell: one tabbed surface shared by the better-sidebar tab and
+ * the DSH settings section. Only Catalog and Settings carry content so far;
+ * the rest show "coming soon" placeholders until their phases land.
+ */
+function MarketShell(props: MpTabProps) {
+  const uiLangCode = useUiLang()
+  const t = UI[uiLangCode] as UiDict
+  const [tab, setTab] = useState<ShellTab>('catalog')
+
+  const tabs: Array<{ id: ShellTab; label: string }> = [
+    { id: 'catalog', label: t.title },
+    { id: 'mine', label: t.tabMine },
+    { id: 'favorites', label: t.tabFavorites },
+    { id: 'themes', label: t.tabThemes },
+    { id: 'diagnostics', label: t.tabDiagnostics },
+    { id: 'settings', label: t.tabSettings },
+  ]
+
+  return (
+    <div style={S.root}>
+      <div style={S.tabbar}>
+        {tabs.map((entry) => (
+          <button
+            key={entry.id}
+            type="button"
+            style={{ ...S.tab, ...(tab === entry.id ? S.tabActive : {}) }}
+            onClick={() => setTab(entry.id)}
+          >
+            {entry.label}
+          </button>
+        ))}
+      </div>
+      {tab === 'catalog' ? <CatalogView {...props} /> : null}
+      {tab === 'settings' ? <SettingsView /> : null}
+      {COMING_TABS.includes(tab as (typeof COMING_TABS)[number]) ? (
+        <div style={S.placeholder}>{t.comingSoon}</div>
+      ) : null}
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------- apply
+
+/** The slots-service surface this plugin touches (soft: may be absent). */
+interface SlotsLike {
+  inject(name: string, register: () => (() => void) | void): void
+  register(options: Record<string, unknown>, render: (ownerProps: unknown) => ReactNode): (() => void) | void
+}
 
 export function apply(ctx: import('@deepseek-ai/cordis').Context): void {
   // Soft integration: the tab mounts through a child fiber with its own
@@ -1233,9 +1461,32 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context): void {
           icon: (size: number) => <BrandMark size={size} />,
           order: 55,
           single: true,
-          component: (tabProps) => <CatalogView {...tabProps} />,
+          component: (tabProps) => <MarketShell {...tabProps} />,
         }),
       'dsh-plugins-mp: catalog tab')
     },
+  })
+
+  // Second mount: a DSH Settings section (Settings → Marketplace), same shell,
+  // different surface. Soft dynamic injection — a host without the slots
+  // service simply skips it, exactly like the sidebar mount above.
+  void (ctx as unknown as {
+    inject?: (deps: string[], fn: (sctx: unknown) => void) => unknown
+  }).inject?.(['slots'], (sctx) => {
+    const slots = (sctx as { slots?: SlotsLike }).slots
+    if (slots === undefined) return
+    // The label closure reads the CURRENT interface language at call time, so
+    // any shell re-render after a language flip shows fresh text (the
+    // ui-settings contract leaves re-rendering to the registrant; a full
+    // re-register loop is not worth it for one word).
+    const off = slots.inject('settings.section', () =>
+      slots.register(
+        { name: 'settings.section', id: 'dsh-plugins-mp', order: 46, label: () => uiLang().title },
+        () => <MarketShell visible scope={{ sessionId: 'settings' }} />,
+      ),
+    )
+    if (typeof off === 'function') {
+      ctx.effect(() => off as () => void, 'dsh-plugins-mp: settings section')
+    }
   })
 }

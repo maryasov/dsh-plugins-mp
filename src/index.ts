@@ -2,7 +2,7 @@
  * dsh-plugins-mp, node half: model-facing tools over the marketplace API
  * (dsh-plugins-mp.com). Registered through ctx.tools.register(defineTool)
  * per the DSH tool-authoring contract; the plugin stays a thin API adapter —
- * no execution, no persistence.
+ * no execution, no persistence beyond its `.dsh-mp/state.json` settings.
  */
 import { defineTool, type InferValue, type ObjectValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import {
@@ -18,11 +18,23 @@ import {
   type MpDetail,
 } from './api.js'
 import { labels, pickLang, type Lang } from './i18n.js'
+import { logEvent } from './log.js'
+import { resolveStateDir } from './mp-home.js'
 import { mountRoutes } from './routes.js'
+import type { MpRuntime } from './runtime.js'
+import { loadMpState, saveMpState, type MpState } from './store.js'
 export { mountRoutes }
 
 export const name = 'dsh-plugins-mp'
 export const inject = ['tools']
+
+/** Loader config (cordis.patch.yml `config:` block) + .env overrides. */
+export interface MpPluginConfig extends MpApiConfig {
+  /** Explicit profile override; defaults to the running CLI's --profile or "web". */
+  profile?: string
+  /** Boot-time agent-tools default; the Settings toggle persists into state.json. */
+  agentTools?: boolean
+}
 
 /** Only the surface we use — keeps the plugin buildable outside the DSH workspace. */
 export interface MpContext {
@@ -84,15 +96,17 @@ function compatRows(detail: MpDetail, lang: Lang): Array<{ dsh: string; status: 
   }))
 }
 
-export function apply(ctx: MpContext, config: MpApiConfig = {}): void {
-  const apiBase = resolveApiBase(config)
-
-  // Web-profile-only HTTP surface (host version + one-click install). Headless
-  // profiles keep working: routes mount through dynamic injection and simply
-  // do not appear without a webServer service.
-  mountRoutes(ctx, config)
-
-  ctx.tools.register(
+/**
+ * The five model-facing tools, as one registrable unit: a single disposer
+ * covers them all, so the Settings toggle can add/remove the whole surface
+ * live (no recompose, no restart).
+ */
+function registerTools(ctx: MpContext, apiBase: string): () => void {
+  const disposers: Array<unknown> = []
+  const register = (definition: ReturnType<typeof defineTool>): void => {
+    disposers.push(ctx.tools.register(definition))
+  }
+  register(
     defineTool({
       name: 'mp_search',
       description:
@@ -148,7 +162,7 @@ export function apply(ctx: MpContext, config: MpApiConfig = {}): void {
     }),
   )
 
-  ctx.tools.register(
+  register(
     defineTool({
       name: 'mp_similar',
       description:
@@ -187,7 +201,7 @@ export function apply(ctx: MpContext, config: MpApiConfig = {}): void {
     }),
   )
 
-  ctx.tools.register(
+  register(
     defineTool({
       name: 'mp_details',
       description:
@@ -272,7 +286,7 @@ export function apply(ctx: MpContext, config: MpApiConfig = {}): void {
     }),
   )
 
-  ctx.tools.register(
+  register(
     defineTool({
       name: 'mp_install',
       description:
@@ -313,7 +327,7 @@ export function apply(ctx: MpContext, config: MpApiConfig = {}): void {
     }),
   )
 
-  ctx.tools.register(
+  register(
     defineTool({
       name: 'mp_trending',
       description:
@@ -355,4 +369,61 @@ export function apply(ctx: MpContext, config: MpApiConfig = {}): void {
       },
     }),
   )
+  return () => {
+    for (const dispose of disposers) {
+      if (typeof dispose === 'function') dispose()
+    }
+    disposers.length = 0
+  }
+}
+
+export function apply(ctx: MpContext, config: MpPluginConfig = {}): void {
+  const apiBase = resolveApiBase(config)
+  const stateDir = resolveStateDir(config)
+  const state = loadMpState(stateDir)
+
+  // Effective boot value: an explicit loader-config flag wins over the
+  // persisted Settings toggle; both default to enabled.
+  let agentTools = config.agentTools ?? state.agentTools
+
+  let disposeTools: (() => void) | null = null
+  const applyTools = (): void => {
+    if (agentTools && disposeTools === null) disposeTools = registerTools(ctx, apiBase)
+    if (!agentTools && disposeTools !== null) {
+      disposeTools()
+      disposeTools = null
+    }
+  }
+
+  const runtime: MpRuntime = {
+    getState: () => state,
+    updateState: (patch) => {
+      Object.assign(state, patch)
+      saveMpState(stateDir, state)
+      return state
+    },
+    stateDir: () => stateDir,
+    agentToolsEnabled: () => agentTools,
+    setAgentTools: (on) => {
+      if (on === agentTools) return
+      agentTools = on
+      state.agentTools = on
+      saveMpState(stateDir, state)
+      applyTools()
+    },
+  }
+
+  // Persist the effective boot value so state.json always mirrors reality
+  // (e.g. the first run after a config flip).
+  if (state.agentTools !== agentTools) {
+    state.agentTools = agentTools
+    saveMpState(stateDir, state)
+  }
+
+  // Web-profile-only HTTP surface (host version, one-click install, settings,
+  // log export). Headless profiles keep working: routes mount through dynamic
+  // injection and simply do not appear without a webServer service.
+  mountRoutes(ctx, config, runtime)
+  applyTools()
+  logEvent('info', 'boot', `applied (agent tools ${agentTools ? 'on' : 'off'}, profile dir ${stateDir})`)
 }
