@@ -16,6 +16,8 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { ReactNode } from 'react'
 import { BrandMark } from './brand'
+import { installClientStyle } from './client-style'
+import { ensureFavorites, toggleFavorite, useFavorites } from './favorites'
 import { installSettingsNavStyle, registerSettingsNavIcon } from './settings-nav-icon'
 
 interface MpTabProps {
@@ -94,6 +96,10 @@ interface MpCard {
   displayName: string
   authorName: string | null
   shortDescription: string | null
+  /** Detected language of the original text — the badge next to ★. */
+  originalLang?: string
+  /** Original short text not yet translated into the UI locale (badge pulses). */
+  shortPending?: boolean
   npmPackage: string | null
   repoOwner: string | null
   repoName: string | null
@@ -118,6 +124,8 @@ interface MpDetail {
   plugin: MpCard & {
     descriptionMd: string
     originalLang: string
+    /** README screenshots extracted at sync time (GitHub-hosted, capped). */
+    screenshots: string[]
     capabilities: Record<string, boolean>
     deprecatedReason: string | null
     homepageUrl: string | null
@@ -126,6 +134,14 @@ interface MpDetail {
   }
   versions: Array<{ version: string; publishedAt?: string | null; testRuns?: MpTestRun[] }>
   similar: MpCard[]
+}
+
+interface MpReadme {
+  markdown: string
+  locale: string
+  isMachine: boolean
+  originalLang: string
+  available: string[]
 }
 
 async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -294,7 +310,11 @@ const UI = {
     missingRows: 'Listed but not on disk',
     linkRows: 'Local (link/file) plugins',
     disabledRowsLabel: 'Disabled rows',
-    liveRows: 'Hot-mounted now',
+    liveRows: 'Hot-mounted now',    origLang: 'Original language',
+    favAdd: 'Add to favorites',
+    favRemove: 'Remove from favorites',
+    favEmpty: 'Nothing here yet — tap ♥ on a card.',
+    screenshots: 'Screenshots',
   },
   zh: {
     title: '插件市场',
@@ -366,7 +386,11 @@ const UI = {
     missingRows: '清单中列出但磁盘上不存在',
     linkRows: '本地 (link/file) 插件',
     disabledRowsLabel: '已禁用的行',
-    liveRows: '热挂载中',
+    liveRows: '热挂载中',    origLang: '原文语言',
+    favAdd: '加入收藏',
+    favRemove: '取消收藏',
+    favEmpty: '还没有收藏 — 点击卡片上的 ♥。',
+    screenshots: '截图',
   },
   ru: {
     title: 'Маркетплейс',
@@ -438,7 +462,11 @@ const UI = {
     missingRows: 'В манифесте, но не на диске',
     linkRows: 'Локальные (link/file) плагины',
     disabledRowsLabel: 'Отключённые строки',
-    liveRows: 'Hot-смонтированы сейчас',
+    liveRows: 'Hot-смонтированы сейчас',    origLang: 'Язык оригинала',
+    favAdd: 'В избранное',
+    favRemove: 'Убрать из избранного',
+    favEmpty: 'Пока пусто — нажмите ♥ на карточке.',
+    screenshots: 'Скриншоты',
   },
 } as const
 
@@ -605,6 +633,26 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 11,
     whiteSpace: 'nowrap',
   },
+  langChip: {
+    flexShrink: 0,
+    padding: '1px 5px',
+    borderRadius: 5,
+    border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.35))',
+    fontSize: 10,
+    fontWeight: 600,
+    letterSpacing: '0.4px',
+    opacity: 0.85,
+    whiteSpace: 'nowrap',
+  },
+  favBtn: {
+    flexShrink: 0,
+    cursor: 'pointer',
+    fontSize: 13,
+    lineHeight: 1,
+    opacity: 0.45,
+    padding: '0 1px',
+  },
+  favOn: { opacity: 1, color: '#e8a33d' },
   installBtn: {
     marginLeft: 'auto',
     border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.35))',
@@ -785,9 +833,19 @@ function inlineMd(text: string, key: string): ReactNode[] {
     } else if (token.startsWith('**')) {
       out.push(<strong key={k}>{token.slice(2, -2)}</strong>)
     } else if (token.startsWith('!')) {
-      // image — render as a link, never load remote images
+      // image — lazy-loaded, capped to the card width; unresolvable srcs hide
       const mm = /\[([^\]]*)\]\(([^)]+)\)/.exec(token.slice(1))
-      out.push(<a key={k} href={mm?.[2] ?? '#'} target="_blank" rel="noreferrer">{mm?.[1] ?? 'image'}</a>)
+      const src = mm?.[2] ?? ''
+      out.push(
+        <img
+          key={k}
+          src={src}
+          alt={mm?.[1] ?? ''}
+          loading="lazy"
+          style={{ maxWidth: '100%', borderRadius: 8, margin: '4px 0', display: 'block' }}
+          onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
+        />,
+      )
     } else {
       const mm = /\[([^\]]*)\]\(([^)]+)\)/.exec(token)
       out.push(<a key={k} href={mm?.[2] ?? '#'} target="_blank" rel="noreferrer">{mm?.[1] ?? token}</a>)
@@ -799,10 +857,25 @@ function inlineMd(text: string, key: string): ReactNode[] {
 }
 
 function Markdown(props: { source: string }): ReactNode {
-  const lines = props.source.split(/\r?\n/)
+  // READMEs arrive full of raw HTML: <img> banners are the screenshots, other
+  // tags would print as literal text — <img> becomes a markdown image, the
+  // rest of the markup is stripped down to its text content. Table rows keep
+  // their monospace layout in a <pre>.
+  const normalized = props.source
+    .replace(/<img\b[^>]*?\bsrc\s*=\s*"([^"]+)"[^>]*>/gi, '![]($1)')
+    .replace(/<img\b[^>]*?\bsrc\s*=\s*'([^']+)'[^>]*>/gi, '![]($1)')
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+  const lines = normalized.split(/\r?\n/)
   const blocks: ReactNode[] = []
   let para: string[] = []
   let list: string[] = []
+  let table: string[] | null = null
   let code: string[] | null = null
   const flushPara = (key: string) => {
     if (para.length > 0) {
@@ -820,11 +893,18 @@ function Markdown(props: { source: string }): ReactNode {
       list = []
     }
   }
+  const flushTable = (key: string): void => {
+    if (table !== null && table.length > 0) {
+      blocks.push(<pre key={key} style={{ ...S.pre, overflowX: 'auto' }}>{table.join('\n')}</pre>)
+    }
+    table = null
+  }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     if (line.trim().startsWith('```')) {
       flushPara(`p${i}`)
       flushList(`l${i}`)
+      flushTable(`t${i}`)
       if (code === null) {
         code = []
       } else {
@@ -837,6 +917,18 @@ function Markdown(props: { source: string }): ReactNode {
       code.push(line)
       continue
     }
+    // Markdown-таблица: строка-список |a|b| → моноширинный блок с разделителями
+    if (line.trim().startsWith('|')) {
+      flushPara(`p${i}`)
+      flushList(`l${i}`)
+      if (table === null) table = []
+      if (!/^[:\-\s|]+$/.test(line.trim())) {
+        const cells = line.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim())
+        table.push(cells.join('  ·  '))
+      }
+      continue
+    }
+    flushTable(`t${i}`)
     const heading = /^#{1,4}\s+(.*)$/.exec(line)
     if (heading !== null) {
       flushPara(`p${i}`)
@@ -863,6 +955,7 @@ function Markdown(props: { source: string }): ReactNode {
   }
   flushPara('pend')
   flushList('lend')
+  flushTable('tend')
   if (code !== null) blocks.push(<pre key="cend" style={S.pre}>{code.join('\n')}</pre>)
   return <>{blocks}</>
 }
@@ -996,6 +1089,8 @@ function compatBadge(
 function Card(props: { card: MpCard; dshVersion: string | null; onOpen: () => void }) {
   const t = uiLang()
   const c = props.card
+  const favs = useFavorites()
+  const isFav = favs.includes(c.slug)
   return (
     <button style={S.card} onClick={props.onOpen}>
       <span style={S.cardHead}>
@@ -1004,6 +1099,30 @@ function Card(props: { card: MpCard; dshVersion: string | null; onOpen: () => vo
         </span>
         <span style={S.cardName}>{c.displayName}</span>
         <span style={S.cardStars}>★ {c.stars}</span>
+        {c.originalLang != null && (
+          <span
+            className={c.shortPending === true ? 'dsh-mp-pulse' : undefined}
+            style={S.langChip}
+            title={
+              c.shortPending === true
+                ? `${t.origLang}: ${c.originalLang.toUpperCase()} · ⚙`
+                : `${t.origLang}: ${c.originalLang.toUpperCase()}`
+            }
+          >
+            {c.originalLang.toUpperCase()}
+          </span>
+        )}
+        <span
+          role="button"
+          style={{ ...S.favBtn, ...(isFav ? S.favOn : {}) }}
+          title={isFav ? t.favRemove : t.favAdd}
+          onClick={(e) => {
+            e.stopPropagation()
+            toggleFavorite(c.slug)
+          }}
+        >
+          ♥
+        </span>
       </span>
       {c.shortDescription !== null && c.shortDescription !== '' && (
         <span style={S.desc}>{c.shortDescription}</span>
@@ -1247,19 +1366,40 @@ function DetailView(props: {
   const [copied, setCopied] = useState(false)
   const [profile, setProfile] = useState('web')
   const [descLoc, setDescLoc] = useState<string | null>(null)
+  const [readme, setReadme] = useState<MpReadme | null>(null)
+  const [shot, setShot] = useState<number | null>(null)
 
   useEffect(() => {
     const ctrl = new AbortController()
     setDetail(null)
     setError(null)
     setDescLoc(null)
+    setReadme(null)
+    setShot(null)
     api<MpDetail>(`/plugins/${encodeURIComponent(props.slug)}`, ctrl.signal)
       .then(setDetail)
       .catch((e) => {
         if (!ctrl.signal.aborted) setError(String(e))
       })
+    // Stored+localized README (parity plan 3.8): the server picks the ready
+    // translation for the UI locale; translations themselves are produced by
+    // the server-side sweep, so a fresh README may still be in the original
+    // language here.
+    api<MpReadme>(`/plugins/${encodeURIComponent(props.slug)}/readme?locale=${langCode()}`, ctrl.signal)
+      .then(setReadme)
+      .catch(() => {})
     return () => ctrl.abort()
   }, [props.slug])
+
+  // Fullscreen screenshot preview closes on Esc, like the settings layer.
+  useEffect(() => {
+    if (shot === null) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setShot(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [shot])
 
   if (error !== null) return <div style={S.body}>{t.empty} ({error})</div>
   if (detail === null) return <div style={S.body}>{t.loading}</div>
@@ -1412,6 +1552,80 @@ function DetailView(props: {
           </div>
         )}
         {desc !== '' ? <Markdown source={desc} /> : <div style={S.muted}>{t.empty}</div>}
+        {(p.screenshots?.length ?? 0) > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <div style={S.muted}>{t.screenshots}</div>
+            <div style={{ display: 'flex', gap: 6, overflowX: 'auto', padding: '6px 0' }}>
+              {p.screenshots.map((src, i) => (
+                <img
+                  key={src}
+                  src={src}
+                  alt=""
+                  loading="lazy"
+                  style={{
+                    height: 88,
+                    borderRadius: 8,
+                    border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.35))',
+                    cursor: 'zoom-in',
+                    display: 'block',
+                  }}
+                  onClick={() => setShot(i)}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+        {readme !== null && readme.markdown !== '' && readme.markdown !== desc && (
+          <div style={{ marginTop: 16 }}>
+            <div style={S.muted}>README</div>
+            <Markdown source={readme.markdown} />
+          </div>
+        )}
+        {shot !== null && p.screenshots[shot] !== undefined && (
+          <div
+            style={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 100000,
+              background: 'rgba(0,0,0,0.85)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: 'zoom-out',
+            }}
+            onClick={() => setShot(null)}
+          >
+            <img
+              src={p.screenshots[shot]}
+              alt=""
+              style={{ maxWidth: '94vw', maxHeight: '92vh', objectFit: 'contain', display: 'block' }}
+            />
+            {p.screenshots.length > 1 && (
+              <>
+                <button
+                  type="button"
+                  style={{ ...S.overlayNav, left: 8 }}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setShot((shot - 1 + p.screenshots.length) % p.screenshots.length)
+                  }}
+                >
+                  ‹
+                </button>
+                <button
+                  type="button"
+                  style={{ ...S.overlayNav, right: 8 }}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setShot((shot + 1) % p.screenshots.length)
+                  }}
+                >
+                  ›
+                </button>
+              </>
+            )}
+          </div>
+        )}
         {detail.versions.length > 0 && (
           <div style={{ marginTop: 14 }}>
             <div style={S.muted}>{t.versions}</div>
@@ -1491,6 +1705,21 @@ Object.assign(S, {
   },
   toggleOn: { background: 'var(--dsw-alias-accent-soft, rgba(77,107,254,0.25))', borderColor: 'var(--dsw-alias-accent, #4d6bfe)' },
   link: { color: 'inherit', fontSize: 12, textDecoration: 'underline', cursor: 'pointer' },
+  overlayNav: {
+    position: 'absolute',
+    top: '50%',
+    transform: 'translateY(-50%)',
+    appearance: 'none',
+    border: 'none',
+    borderRadius: 999,
+    width: 40,
+    height: 40,
+    fontSize: 22,
+    lineHeight: 1,
+    cursor: 'pointer',
+    background: 'rgba(128,128,128,0.25)',
+    color: '#fff',
+  },
 })
 
 /** Settings tab: the agent-tools switch, pnpm health, log export, planned rows. */
@@ -1824,8 +2053,53 @@ function useRestartFlow(): { pending: boolean; restarting: boolean; arm: () => v
   return { pending, restarting, arm }
 }
 
-const COMING_TABS = ['favorites', 'themes'] as const
-type ShellTab = 'catalog' | 'mine' | 'diagnostics' | (typeof COMING_TABS)[number] | 'settings'
+const COMING_TABS = ['themes'] as const
+type ShellTab = 'catalog' | 'mine' | 'favorites' | 'diagnostics' | (typeof COMING_TABS)[number] | 'settings'
+
+/**
+ * Favorites tab (plan 3.2): cards for the slugs persisted in the host's
+ * state.json. The list refetches whenever the favorites set changes, so a
+ * ♥ toggle inside the tab removes the card on the next roundtrip.
+ */
+function FavoritesView() {
+  const t = uiLang()
+  const favorites = useFavorites()
+  const favKey = favorites.join(',')
+  const [items, setItems] = useState<MpCard[] | null>(null)
+  const [slug, setSlug] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (favorites.length === 0) {
+      setItems([])
+      return
+    }
+    const usp = new URLSearchParams({ slugs: favKey, limit: '100', sort: 'stars' })
+    api<{ items: MpCard[] }>(`/plugins?${usp.toString()}`)
+      .then((d) => setItems(d.items))
+      .catch(() => setItems([]))
+  }, [favKey, favorites.length])
+
+  if (slug !== null) {
+    return (
+      <DetailView slug={slug} dshVersion={null} onBack={() => setSlug(null)} onOpenSlug={setSlug} />
+    )
+  }
+  return (
+    <div style={S.list}>
+      {items === null ? (
+        <div style={S.placeholder}>{t.loading}</div>
+      ) : items.length === 0 ? (
+        <div style={S.placeholder}>{t.favEmpty}</div>
+      ) : (
+        <div style={S.grid}>
+          {items.map((c) => (
+            <Card key={c.slug} card={c} dshVersion={null} onOpen={() => setSlug(c.slug)} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 /**
  * The market shell: one tabbed surface shared by the better-sidebar tab and
@@ -1843,6 +2117,11 @@ function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
   const [fullscreen, setFullscreen] = useState(false)
   const surface = props.surface ?? 'sidebar'
   const { pending: restartPending, restarting, arm: armRestart } = useRestartFlow()
+
+  useEffect(() => {
+    ensureFavorites()
+    return installClientStyle()
+  }, [])
 
   useEffect(() => {
     if (!fullscreen) return
@@ -1893,6 +2172,7 @@ function MarketShell(props: MpTabProps & { surface?: 'sidebar' | 'settings' }) {
       </div>
       {tab === 'catalog' ? <CatalogView {...props} /> : null}
       {tab === 'mine' ? <InstalledView onNeedsRestart={armRestart} /> : null}
+      {tab === 'favorites' ? <FavoritesView /> : null}
       {tab === 'settings' ? (
         <SettingsView>
           <PnpmHealthRow />

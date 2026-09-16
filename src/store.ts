@@ -18,10 +18,12 @@ export interface MpState {
   fingerprint: string
   /** Whether the five mp_* model-facing tools are registered (Settings toggle). */
   agentTools: boolean
+  /** Favorite marketplace slugs (Favorites tab), capped defensively. */
+  favorites: string[]
 }
 
 function defaults(): MpState {
-  return { schemaVersion: SCHEMA_VERSION, fingerprint: randomUUID(), agentTools: true }
+  return { schemaVersion: SCHEMA_VERSION, fingerprint: randomUUID(), agentTools: true, favorites: [] }
 }
 
 export function statePath(dir: string): string {
@@ -42,6 +44,11 @@ export function loadMpState(dir: string): MpState {
         ? parsed.fingerprint
         : fallback.fingerprint,
       agentTools: parsed.agentTools !== false,
+      favorites: Array.isArray(parsed.favorites)
+        ? parsed.favorites
+            .filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length <= 200)
+            .slice(0, 500)
+        : [],
     }
   } catch {
     return fallback
