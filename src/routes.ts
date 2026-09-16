@@ -43,6 +43,7 @@ export const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 export const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
 export const SETTINGS_ROUTE = '/plugins/dsh-plugins-mp/settings'
 export const FAVORITE_ROUTE = '/plugins/dsh-plugins-mp/favorite'
+export const NOTE_ROUTE = '/plugins/dsh-plugins-mp/note'
 export const LOGS_ROUTE = '/plugins/dsh-plugins-mp/logs'
 export const INSTALLED_ROUTE = '/plugins/dsh-plugins-mp/installed'
 export const UNINSTALL_ROUTE = '/plugins/dsh-plugins-mp/uninstall'
@@ -565,6 +566,54 @@ export function mountRoutes(ctx: {
         },
       })
 
+      // Notes (plan #21, v1 local): slug → free-form text in state.json.
+      // GET returns the map; POST { slug, text } sets one (empty text removes).
+      const stopNote = webServer.register({
+        kind: 'exact',
+        path: NOTE_ROUTE,
+        handler: async (req, res) => {
+          if (req.method === 'GET') {
+            json(res, 200, { notes: runtime?.getState().notes ?? {} })
+            return
+          }
+          if (req.method !== 'POST') {
+            json(res, 405, { error: 'method not allowed' })
+            return
+          }
+          if (!requestAllowed(req)) {
+            json(res, 403, { error: 'forbidden' })
+            return
+          }
+          if (runtime === undefined) {
+            json(res, 503, { error: 'runtime is not available' })
+            return
+          }
+          let body: { slug?: unknown; text?: unknown } = {}
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            json(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const slug = typeof body.slug === 'string' ? body.slug : ''
+          if (!SLUG_RE.test(slug)) {
+            json(res, 400, { error: 'invalid slug' })
+            return
+          }
+          if (typeof body.text !== 'string') {
+            json(res, 400, { error: 'text must be a string' })
+            return
+          }
+          const notes = { ...runtime.getState().notes }
+          const text = body.text.trim()
+          if (text === '') delete notes[slug]
+          else notes[slug] = text.slice(0, 2000)
+          runtime.updateState({ notes })
+          logEvent('info', 'note', `${text === '' ? '-' : '+'} ${slug}`)
+          json(res, 200, { notes })
+        },
+      })
+
       const stopLogs = webServer.register({
         kind: 'exact',
         path: LOGS_ROUTE,
@@ -1003,6 +1052,7 @@ export function mountRoutes(ctx: {
         stopInstall()
         stopSettings()
         stopFavorite()
+        stopNote()
         stopLogs()
         stopInstalled()
         stopUninstall()

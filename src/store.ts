@@ -20,10 +20,33 @@ export interface MpState {
   agentTools: boolean
   /** Favorite marketplace slugs (Favorites tab), capped defensively. */
   favorites: string[]
+  /** Per-plugin notes (plan #21, v1 local): slug → free-form text. */
+  notes: Record<string, string>
+}
+
+const MAX_NOTES = 200
+const MAX_NOTE_CHARS = 2000
+
+function sanitizeNotes(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null) return {}
+  const out: Record<string, string> = {}
+  for (const [slug, text] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof slug !== 'string' || slug.length === 0 || slug.length > 200) continue
+    if (typeof text !== 'string' || text.trim() === '') continue
+    if (Object.keys(out).length >= MAX_NOTES) break
+    out[slug] = text.slice(0, MAX_NOTE_CHARS)
+  }
+  return out
 }
 
 function defaults(): MpState {
-  return { schemaVersion: SCHEMA_VERSION, fingerprint: randomUUID(), agentTools: true, favorites: [] }
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    fingerprint: randomUUID(),
+    agentTools: true,
+    favorites: [],
+    notes: {},
+  }
 }
 
 export function statePath(dir: string): string {
@@ -49,6 +72,7 @@ export function loadMpState(dir: string): MpState {
             .filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length <= 200)
             .slice(0, 500)
         : [],
+      notes: sanitizeNotes(parsed.notes),
     }
   } catch {
     return fallback

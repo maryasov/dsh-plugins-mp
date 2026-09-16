@@ -54,6 +54,7 @@ const API_BASE_DEFAULT = 'https://dsh-plugins-mp.com/api'
 const CONFIG_ROUTE = '/plugins/dsh-plugins-mp/config'
 const HOST_ROUTE = '/plugins/dsh-plugins-mp/host'
 const INSTALL_ROUTE = '/plugins/dsh-plugins-mp/install'
+const NOTE_ROUTE = '/plugins/dsh-plugins-mp/note'
 const SETTINGS_ROUTE = '/plugins/dsh-plugins-mp/settings'
 const LOGS_ROUTE = '/plugins/dsh-plugins-mp/logs'
 
@@ -132,7 +133,7 @@ interface MpDetail {
     sourceUpdatedAt: string | null
     translations: Array<{ locale: string; kind: string; textMd: string; isMachine: boolean }>
   }
-  versions: Array<{ version: string; publishedAt?: string | null; testRuns?: MpTestRun[] }>
+  versions: Array<{ version: string; publishedAt?: string | null; changelogMd?: string | null; testRuns?: MpTestRun[] }>
   similar: MpCard[]
 }
 
@@ -315,6 +316,11 @@ const UI = {
     favRemove: 'Remove from favorites',
     favEmpty: 'Nothing here yet — tap ♥ on a card.',
     screenshots: 'Screenshots',
+    noteLabel: 'Note',
+    notePlaceholder: 'Your private note about this plugin…',
+    noteSave: 'Save note',
+    noteSaved: 'Saved',
+    changelog: 'Release notes',
   },
   zh: {
     title: '插件市场',
@@ -391,6 +397,11 @@ const UI = {
     favRemove: '取消收藏',
     favEmpty: '还没有收藏 — 点击卡片上的 ♥。',
     screenshots: '截图',
+    noteLabel: '笔记',
+    notePlaceholder: '关于此插件的私有笔记…',
+    noteSave: '保存笔记',
+    noteSaved: '已保存',
+    changelog: '发布说明',
   },
   ru: {
     title: 'Маркетплейс',
@@ -467,6 +478,11 @@ const UI = {
     favRemove: 'Убрать из избранного',
     favEmpty: 'Пока пусто — нажмите ♥ на карточке.',
     screenshots: 'Скриншоты',
+    noteLabel: 'Заметка',
+    notePlaceholder: 'Личная заметка об этом плагине…',
+    noteSave: 'Сохранить заметку',
+    noteSaved: 'Сохранено',
+    changelog: 'Что нового',
   },
 } as const
 
@@ -1368,6 +1384,9 @@ function DetailView(props: {
   const [descLoc, setDescLoc] = useState<string | null>(null)
   const [readme, setReadme] = useState<MpReadme | null>(null)
   const [shot, setShot] = useState<number | null>(null)
+  const [note, setNote] = useState('')
+  const [noteState, setNoteState] = useState<'idle' | 'busy' | 'saved'>('idle')
+  const [openChangelog, setOpenChangelog] = useState<string | null>(null)
 
   useEffect(() => {
     const ctrl = new AbortController()
@@ -1376,6 +1395,9 @@ function DetailView(props: {
     setDescLoc(null)
     setReadme(null)
     setShot(null)
+    setNote('')
+    setNoteState('idle')
+    setOpenChangelog(null)
     api<MpDetail>(`/plugins/${encodeURIComponent(props.slug)}`, ctrl.signal)
       .then(setDetail)
       .catch((e) => {
@@ -1387,6 +1409,13 @@ function DetailView(props: {
     // language here.
     api<MpReadme>(`/plugins/${encodeURIComponent(props.slug)}/readme?locale=${langCode()}`, ctrl.signal)
       .then(setReadme)
+      .catch(() => {})
+    fetch(NOTE_ROUTE, { headers: { accept: 'application/json' }, signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { notes?: Record<string, string> } | null) => {
+        const text = d?.notes?.[props.slug]
+        if (typeof text === 'string' && text !== '') setNote(text)
+      })
       .catch(() => {})
     return () => ctrl.abort()
   }, [props.slug])
@@ -1403,6 +1432,21 @@ function DetailView(props: {
 
   if (error !== null) return <div style={S.body}>{t.empty} ({error})</div>
   if (detail === null) return <div style={S.body}>{t.loading}</div>
+
+  const saveNote = (): void => {
+    setNoteState('busy')
+    fetch(NOTE_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ slug: props.slug, text: note }),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error(String(r.status))
+        setNoteState('saved')
+        setTimeout(() => setNoteState('idle'), 1500)
+      })
+      .catch(() => setNoteState('idle'))
+  }
 
   const p = detail.plugin
   const cmd = installCommandFor(p, profile)
@@ -1512,6 +1556,31 @@ function DetailView(props: {
           </button>
         </div>
         {p.deprecatedReason !== null && <div style={S.err}>{p.deprecatedReason}</div>}
+        <div style={{ ...S.cmd, alignItems: 'stretch', flexDirection: 'column', gap: 4 }}>
+          <div style={S.muted}>{t.noteLabel}</div>
+          <textarea
+            value={note}
+            placeholder={t.notePlaceholder}
+            onChange={(e) => setNote(e.target.value)}
+            style={{
+              width: '100%',
+              boxSizing: 'border-box',
+              minHeight: 52,
+              resize: 'vertical',
+              borderRadius: 6,
+              border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.35))',
+              background: 'transparent',
+              color: 'inherit',
+              font: 'inherit',
+              fontSize: 12,
+              padding: '5px 8px',
+              outline: 'none',
+            }}
+          />
+          <button type="button" style={{ ...S.copyBtn, marginLeft: 0, alignSelf: 'flex-end' }} onClick={saveNote}>
+            {noteState === 'busy' ? '…' : noteState === 'saved' ? t.noteSaved : t.noteSave}
+          </button>
+        </div>
       </div>
       <div style={S.body}>
         {(props.dshVersion !== null || otherRuns.length > 0) && (
@@ -1629,12 +1698,28 @@ function DetailView(props: {
         {detail.versions.length > 0 && (
           <div style={{ marginTop: 14 }}>
             <div style={S.muted}>{t.versions}</div>
-            {detail.versions.slice(0, 6).map((v) => (
-              <div key={v.version} style={{ display: 'flex', gap: 8, alignItems: 'baseline', margin: '2px 0' }}>
-                <code style={S.code}>{v.version}</code>
-                <span style={S.muted}>{fmtDate(v.publishedAt) ?? ''}</span>
-              </div>
-            ))}
+            {detail.versions.slice(0, 6).map((v) => {
+              const hasNotes = typeof v.changelogMd === 'string' && v.changelogMd.trim() !== ''
+              const expanded = openChangelog === v.version
+              return (
+                <div key={v.version} style={{ margin: '2px 0' }}>
+                  <div
+                    role={hasNotes ? 'button' : undefined}
+                    onClick={hasNotes ? () => setOpenChangelog(expanded ? null : v.version) : undefined}
+                    style={{ display: 'flex', gap: 8, alignItems: 'baseline', margin: '2px 0', cursor: hasNotes ? 'pointer' : undefined }}
+                  >
+                    <code style={S.code}>{v.version}</code>
+                    <span style={S.muted}>{fmtDate(v.publishedAt) ?? ''}</span>
+                    {hasNotes && <span style={S.muted}>{expanded ? '▾' : '▸'} {t.changelog}</span>}
+                  </div>
+                  {hasNotes && expanded && (
+                    <div style={{ margin: '4px 0 8px', paddingLeft: 10, borderLeft: '2px solid var(--dsw-alias-border, rgba(128,128,128,0.35))' }}>
+                      <Markdown source={v.changelogMd as string} />
+                    </div>
+                  )}
+                </div>
+              )
+            })}
           </div>
         )}
         {similar.length > 0 && (
