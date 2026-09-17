@@ -116,6 +116,7 @@ interface MpCard {
   repoName: string | null
   stars: number
   npmDownloadsWeek: number
+  i18n?: boolean | null
   license: string | null
   latestVersion: string | null
   primaryLanguage?: string | null
@@ -342,6 +343,7 @@ const UI = {
     groupAdd: 'Add',
     groupEmpty: 'No groups yet.',
     groupPick: '— plugin —',
+    i18nHint: 'UI in multiple languages',
     orderTitle: 'Load order',
     orderHint: 'The order plugins are composed in. In-box bundles are fixed; applies after a restart. A broken order is refused by a boot trial.',
     orderApply: 'Apply',
@@ -467,6 +469,7 @@ const UI = {
     groupAdd: '添加',
     groupEmpty: '暂无分组。',
     groupPick: '— 插件 —',
+    i18nHint: '界面支持多种语言',
     orderTitle: '加载顺序',
     orderHint: '插件在配置中的加载顺序。官方捆绑包固定；重启后生效。坏顺序会被试启动拒绝。',
     orderApply: '应用',
@@ -592,6 +595,7 @@ const UI = {
     groupAdd: 'Добавить',
     groupEmpty: 'Групп пока нет.',
     groupPick: '— плагин —',
+    i18nHint: 'Интерфейс на нескольких языках',
     orderTitle: 'Порядок загрузки',
     orderHint: 'Порядок подключения плагинов в профиле. Официальные бандлы фиксированы; применится после перезапуска. Нерабочий порядок отклонит пробная сборка.',
     orderApply: 'Применить',
@@ -1282,6 +1286,11 @@ function Card(props: { card: MpCard; dshVersion: string | null; onOpen: () => vo
             }
           >
             {c.originalLang.toUpperCase()}
+          </span>
+        )}
+        {c.i18n === true && (
+          <span style={S.langChip} title={t.i18nHint}>
+            🌐
           </span>
         )}
         <span
