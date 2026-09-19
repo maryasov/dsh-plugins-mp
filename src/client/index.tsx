@@ -1533,10 +1533,12 @@ function CatalogView(props: MpTabProps) {
                 onChange={(e) => setQuery(e.target.value)}
               />
             </form>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            {/* Категории и сортировка: верхняя линия и высота 26px общие —
+                селект при переносе чипов на 2-ю строку остаётся у первого ряда. */}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
               <div style={{ ...S.chipRow, flex: 1 }}>
                 <button
-                  style={{ ...S.chip, ...(cat === '' ? S.chipOn : {}) }}
+                  style={{ ...S.chip, height: 26, ...(cat === '' ? S.chipOn : {}) }}
                   onClick={() => setCat('')}
                 >
                   {t.all}
@@ -1544,7 +1546,7 @@ function CatalogView(props: MpTabProps) {
                 {cats.map((c) => (
                   <button
                     key={c.slug}
-                    style={{ ...S.chip, ...(cat === c.slug ? S.chipOn : {}) }}
+                    style={{ ...S.chip, height: 26, ...(cat === c.slug ? S.chipOn : {}) }}
                     onClick={() => setCat(c.slug)}
                   >
                     {catLabel(c.slug, uiLangCode)}{' '}
@@ -1553,7 +1555,7 @@ function CatalogView(props: MpTabProps) {
                 ))}
               </div>
               <select
-                style={S.select}
+                style={{ ...S.select, height: 26, paddingTop: 0, paddingBottom: 0, flexShrink: 0 }}
                 value={sort}
                 onChange={(e) => setSort(e.target.value as typeof sort)}
               >
