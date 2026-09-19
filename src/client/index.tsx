@@ -763,7 +763,6 @@ const S: Record<string, React.CSSProperties> = {
   header: { padding: '10px 12px 8px', display: 'flex', flexDirection: 'column', gap: 8 },
   titleRow: { display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600 },
   hostBadge: {
-    marginLeft: 'auto',
     fontSize: 11,
     padding: '2px 8px',
     borderRadius: 999,
@@ -928,6 +927,17 @@ const S: Record<string, React.CSSProperties> = {
     color: 'inherit',
     font: 'inherit',
     fontSize: 12,
+    cursor: 'pointer',
+    whiteSpace: 'nowrap',
+  },
+  secChip: {
+    flexShrink: 0,
+    padding: '2px 8px',
+    fontSize: 11,
+    borderRadius: 999,
+    border: '1px solid var(--dsw-alias-border, rgba(128,128,128,0.35))',
+    background: 'var(--dsw-alias-bg-base, transparent)',
+    color: 'inherit',
     cursor: 'pointer',
     whiteSpace: 'nowrap',
   },
@@ -1493,6 +1503,21 @@ function CatalogView(props: MpTabProps) {
             <div style={S.titleRow}>
               <BrandMark size={18} />
               {t.title}
+              <div style={{ ...S.chipRow, marginLeft: 'auto' }}>
+                {(['plugin', 'skill', 'app'] as const).map((sKey) => (
+                  <button
+                    key={sKey}
+                    style={{ ...S.secChip, ...(sec === sKey ? S.chipOn : {}) }}
+                    onClick={() => {
+                      if (sKey === sec) return
+                      setSec(sKey)
+                      setCat('')
+                    }}
+                  >
+                    {sKey === 'plugin' ? t.secPlugins : sKey === 'skill' ? t.secSkills : t.secApps}
+                  </button>
+                ))}
+              </div>
               {dshVersion !== null && <span style={S.hostBadge}>DSH {dshVersion}</span>}
             </div>
             <form
@@ -1508,21 +1533,6 @@ function CatalogView(props: MpTabProps) {
                 onChange={(e) => setQuery(e.target.value)}
               />
             </form>
-            <div style={{ ...S.chipRow }}>
-              {(['plugin', 'skill', 'app'] as const).map((sKey) => (
-                <button
-                  key={sKey}
-                  style={{ ...S.chip, ...(sec === sKey ? S.chipOn : {}) }}
-                  onClick={() => {
-                    if (sKey === sec) return
-                    setSec(sKey)
-                    setCat('')
-                  }}
-                >
-                  {sKey === 'plugin' ? t.secPlugins : sKey === 'skill' ? t.secSkills : t.secApps}
-                </button>
-              ))}
-            </div>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <div style={{ ...S.chipRow, flex: 1 }}>
                 <button
