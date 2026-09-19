@@ -30,6 +30,8 @@ export interface MpCard {
   npmDownloadsWeek: number
   tags: string[]
   categories: string[]
+  /** Catalog section: plugin | skill | app (absent on old API versions). */
+  section?: 'plugin' | 'skill' | 'app'
   sourceUpdatedAt: string | null
   latestVersion: string | null
 }
@@ -169,6 +171,7 @@ export function fetchCatalog(
   base: string,
   query: {
     q?: string
+    section?: string
     category?: string
     profile?: string
     installable?: boolean
@@ -181,6 +184,7 @@ export function fetchCatalog(
 ): Promise<CatalogResponse> {
   const usp = new URLSearchParams()
   if (query.q) usp.set('q', query.q)
+  if (query.section) usp.set('section', query.section)
   if (query.category) usp.set('category', query.category)
   if (query.profile) usp.set('profile', query.profile)
   if (query.installable) usp.set('installable', '1')

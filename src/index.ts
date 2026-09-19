@@ -117,7 +117,8 @@ function registerTools(ctx: MpContext, apiBase: string): () => void {
         `Use when the user asks to find/discover plugins, or before installing anything.`,
       parameters: {
         query: { type: 'string', description: 'Free-text search over name, description, npm package name.' },
-        category: { type: 'string', description: 'Category slug filter (e.g. "ui", "tools", "memory").' },
+        section: { type: 'string', description: 'Catalog section: "plugin" (default), "skill" or "app" — sections have disjoint category sets.', enum: ['plugin', 'skill', 'app'] },
+        category: { type: 'string', description: 'Category slug filter (e.g. "ui", "tools", "memory" for plugins; "agents", "design" for skills; "desktop", "utilities" for apps).' },
         profile: { type: 'string', description: 'Profile filter: "web", "tui" or "agent".', enum: ['web', 'tui', 'agent'] },
         installable: { type: 'boolean', description: 'Only plugins that can actually be installed (have a manifest).' },
         sort: { type: 'string', description: 'Sort order.', enum: ['stars', 'updated', 'newest', 'name'] },
@@ -145,6 +146,7 @@ function registerTools(ctx: MpContext, apiBase: string): () => void {
           apiBase,
           {
             q: args.query?.trim() || undefined,
+            section: args.section,
             category: args.category,
             profile: args.profile,
             installable: args.installable,

@@ -289,6 +289,9 @@ const UI = {
     loading: 'Loading…',
     profile: 'Profile',
     all: 'All',
+    secPlugins: 'Plugins',
+    secSkills: 'Skills',
+    secApps: 'Apps',
     sortStars: '★ Stars',
     sortUpdated: 'Updated',
     sortNewest: 'Newest',
@@ -415,6 +418,9 @@ const UI = {
     loading: '加载中…',
     profile: '配置',
     all: '全部',
+    secPlugins: '插件',
+    secSkills: '技能',
+    secApps: '应用',
     sortStars: '★ 星数',
     sortUpdated: '更新时间',
     sortNewest: '最新',
@@ -541,6 +547,9 @@ const UI = {
     loading: 'Загрузка…',
     profile: 'Профиль',
     all: 'Все',
+    secPlugins: 'Плагины',
+    secSkills: 'Скиллы',
+    secApps: 'Приложения',
     sortStars: '★ Звёзды',
     sortUpdated: 'Обновлённые',
     sortNewest: 'Новые',
@@ -717,6 +726,19 @@ const CAT_LABELS: Record<string, Record<LangCode, string>> = {
   dev: { en: 'Development & Infrastructure', zh: '开发与基础设施', ru: 'Разработка и инфраструктура' },
   security: { en: 'Security & Audit', zh: '安全与审计', ru: 'Безопасность и аудит' },
   fun: { en: 'Just for Fun', zh: '娱乐', ru: 'Развлечения' },
+  // skill-section taxonomy
+  agents: { en: 'Agent skills', zh: '智能体技能', ru: 'Агентские навыки' },
+  design: { en: 'Design & slides', zh: '设计与演示', ru: 'Дизайн и презентации' },
+  knowledge: { en: 'Knowledge & docs', zh: '知识与文档', ru: 'Знания и документы' },
+  devops: { en: 'Infra & DevOps', zh: '基础设施与 DevOps', ru: 'Инфраструктура и DevOps' },
+  automation: { en: 'Automation & monitoring', zh: '自动化与监控', ru: 'Автоматизация и мониторинг' },
+  interface: { en: 'Panels & viewers', zh: '面板与查看器', ru: 'Панели и просмотрщики' },
+  // app-section taxonomy
+  desktop: { en: 'Desktop clients', zh: '桌面客户端', ru: 'Десктоп-клиенты' },
+  mobile: { en: 'Mobile', zh: '移动端', ru: 'Мобильные' },
+  web: { en: 'Web apps', zh: '网页应用', ru: 'Веб-приложения' },
+  integrations: { en: 'Integrations', zh: '集成', ru: 'Интеграции' },
+  utilities: { en: 'Utilities', zh: '实用工具', ru: 'Утилиты' },
 }
 
 const LOCALE_LABEL: Record<string, string> = { en: 'EN', zh: '中文', ru: 'RU' }
@@ -1333,6 +1355,8 @@ function CatalogView(props: MpTabProps) {
   const [dshVersion, setDshVersion] = useState<string | null>(null)
   const [cats, setCats] = useState<Array<{ slug: string; count: number }>>([])
   const [cat, setCat] = useState('')
+  // Верхний уровень каталога: у Плагинов/Скиллов/Приложений свои категории.
+  const [sec, setSec] = useState<'plugin' | 'skill' | 'app'>('plugin')
   const [sort, setSort] = useState<'stars' | 'updated' | 'newest' | 'name'>('stars')
 
   useEffect(() => {
@@ -1345,11 +1369,15 @@ function CatalogView(props: MpTabProps) {
         setDshVersion(v !== undefined && v !== 'unknown' ? v : null)
       })
       .catch(() => {})
-    // Category chips with plugin counts.
-    api<Array<{ slug: string; count: number }>>('/categories')
+  }, [])
+
+  // Category chips of the CURRENT section (per-section taxonomies).
+  useEffect(() => {
+    api<Array<{ slug: string; count: number }>>(`/categories?section=${sec}`)
       .then(setCats)
       .catch(() => {})
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sec])
 
   // Short-description translations are produced by the server asynchronously
   // (LLM queue, seconds per plugin). A page response reports pendingShort —
@@ -1379,6 +1407,7 @@ function CatalogView(props: MpTabProps) {
       pages.map((p) => {
         const usp = new URLSearchParams({ limit: '25', page: String(p), installable: '1' })
         if (q !== '') usp.set('q', q)
+        usp.set('section', sec)
         if (cat !== '') usp.set('category', cat)
         usp.set('sort', sort)
         usp.set('locale', langCode())
@@ -1409,6 +1438,7 @@ function CatalogView(props: MpTabProps) {
     setLoading(true)
     const usp = new URLSearchParams({ limit: '25', page: String(nextPage), installable: '1' })
     if (q !== '') usp.set('q', q)
+    usp.set('section', sec)
     if (cat !== '') usp.set('category', cat)
     usp.set('sort', sort)
     usp.set('locale', langCode())
@@ -1437,7 +1467,7 @@ function CatalogView(props: MpTabProps) {
     if (slug !== null) return
     return load(query, 1, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slug, cat, sort])
+  }, [slug, cat, sort, sec])
 
   // Переключение языка интерфейса DSH (html lang): тихо переводим уже
   // загруженные карточки под новый язык. Дозапрос тех же страниц мерджится
@@ -1478,6 +1508,21 @@ function CatalogView(props: MpTabProps) {
                 onChange={(e) => setQuery(e.target.value)}
               />
             </form>
+            <div style={{ ...S.chipRow }}>
+              {(['plugin', 'skill', 'app'] as const).map((sKey) => (
+                <button
+                  key={sKey}
+                  style={{ ...S.chip, ...(sec === sKey ? S.chipOn : {}) }}
+                  onClick={() => {
+                    if (sKey === sec) return
+                    setSec(sKey)
+                    setCat('')
+                  }}
+                >
+                  {sKey === 'plugin' ? t.secPlugins : sKey === 'skill' ? t.secSkills : t.secApps}
+                </button>
+              ))}
+            </div>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <div style={{ ...S.chipRow, flex: 1 }}>
                 <button
@@ -1914,7 +1959,7 @@ function DetailView(props: {
               </div>
             ))}
             <a
-              href={`${siteOrigin()}/${langCode()}/plugins/${encodeURIComponent(props.slug)}`}
+              href={`${siteOrigin()}/plugins/${encodeURIComponent(props.slug)}`}
               target="_blank"
               rel="noreferrer"
               style={{ fontSize: 12 }}
